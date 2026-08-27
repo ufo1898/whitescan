@@ -25,6 +25,17 @@ import time
 import urllib.request
 import urllib.parse
 import urllib.error
+
+
+def _opener():
+    """带可选代理的 opener（WHITESCAN_PROXY 环境变量，如 http://127.0.0.1:10900）"""
+    proxy = os.environ.get("WHITESCAN_PROXY", "").strip()
+    if proxy:
+        return urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    # 无代理时不继承系统环境代理，行为可预测
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 from datetime import datetime, timezone
 
 __version__ = "1.1.0"
@@ -245,7 +256,7 @@ def gh_search(query, per_page=30):
     url = ("https://api.github.com/search/repositories?q="
            + urllib.parse.quote(query) + "&sort=stars&order=asc&per_page=%d" % per_page)
     req = urllib.request.Request(url, headers=_headers())
-    with urllib.request.urlopen(req, timeout=25) as resp:
+    with _opener().open(req, timeout=25) as resp:
         return json.loads(resp.read())
 
 def gh_file_raw(repo, path):
@@ -254,7 +265,7 @@ def gh_file_raw(repo, path):
         url = f"https://raw.githubusercontent.com/{repo}/{branch}/{path}"
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "whitescan"})
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with _opener().open(req, timeout=15) as resp:
                 return resp.read().decode("utf-8", "ignore")
         except urllib.error.HTTPError:
             continue
@@ -264,7 +275,7 @@ def gh_file_raw(repo, path):
     try:
         url = f"https://api.github.com/repos/{repo}/contents/{path}"
         req = urllib.request.Request(url, headers=_headers())
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with _opener().open(req, timeout=15) as resp:
             data = json.loads(resp.read())
             return base64.b64decode(data.get("content", "")).decode("utf-8", "ignore")
     except Exception:
@@ -275,7 +286,7 @@ def gh_repo_root_listing(repo):
     try:
         url = f"https://api.github.com/repos/{repo}/contents/"
         req = urllib.request.Request(url, headers=_headers())
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with _opener().open(req, timeout=15) as resp:
             data = json.loads(resp.read())
             return [item["path"] for item in data if item.get("type") == "file"]
     except Exception:
@@ -420,7 +431,7 @@ def ai_review(code, hits, base_url, api_key, model):
     req = urllib.request.Request(
         base_url.rstrip("/") + "/chat/completions", data=payload,
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"})
-    with urllib.request.urlopen(req, timeout=AI_TIMEOUT) as resp:
+    with _opener().open(req, timeout=AI_TIMEOUT) as resp:
         data = json.loads(resp.read())
     content = data["choices"][0]["message"].get("content") or ""
     if not content.strip():
@@ -560,7 +571,7 @@ def cmd_doctor(args):
     if token:
         try:
             req = urllib.request.Request("https://api.github.com/rate_limit", headers=_headers())
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with _opener().open(req, timeout=10) as resp:
                 rl = json.loads(resp.read())
             core = rl.get("resources", {}).get("search", {})
             checks.append(("GitHub 配额", f"search {core.get('remaining','?')}/{core.get('limit','?')}"))
@@ -598,7 +609,7 @@ def cmd_update(args):
     """自更新: 拉远程版本号对比，新版就覆盖自身"""
     try:
         req = urllib.request.Request(VERSION_URL, headers={"User-Agent": "whitescan"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with _opener().open(req, timeout=15) as resp:
             remote = resp.read().decode().strip()
     except Exception as e:
         print(f"检查更新失败: {e}")
@@ -608,7 +619,7 @@ def cmd_update(args):
         print("已是最新")
         return 0
     req = urllib.request.Request(SELF_URL, headers={"User-Agent": "whitescan"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with _opener().open(req, timeout=30) as resp:
         new_code = resp.read().decode("utf-8")
     me = os.path.abspath(__file__)
     with open(me + ".new", "w", encoding="utf-8") as f:
