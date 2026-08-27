@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WhiteScan Web v1.1.0 — 网页版漏洞扫描器
+WhiteScan Web v1.1.1 — 网页版漏洞扫描器
 =======================================
 标准库 http.server 实现（无 pip 依赖，008 Mac 直接跑）。
 复用 whitescan.py 的规则引擎 + GitHub 探测 + AI 深审。
