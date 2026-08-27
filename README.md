@@ -1,48 +1,94 @@
-# WhiteScan 🔍
+# WhiteScan 🛡️
 
-AI 驱动的 Solidity 智能合约漏洞扫描器。标准库单文件，零依赖，20 条漏洞规则 + 免费大模型语义复核。
+零依赖智能合约漏洞扫描器 — 单文件 Python 标准库，macOS/Linux 直接跑（无需 pip）。
+
+**静态规则扫描 + AI 语义复核** 双引擎：20 条规则初筛，大模型复核降误报，专为批量筛 Compound fork / 借贷协议设计的白帽狩猎工具。
 
 ## 特性
 
-- **零依赖**：纯 Python 3.9+ 标准库（macOS/Linux 直接跑）
-- **GitHub 批量发现**：按关键词批量找借贷协议 fork，自动拉取 .sol 源码
-- **20 条规则**：首存攻击 / ERC-4626 通胀 / 签名重放 / 回调仿冒 / 预言机操纵 / 滑点缺失 / 未验证返回值 / delegatecall 注入 / tx.origin / 时间戳依赖等
-- **AI 语义复核**：正则初筛命中后调 LLM 判定真伪，能拦误报（如存款型 mint 被误判 UNPROTECTED-MINT）
-- **Markdown 报告**：一键生成含 AI 判定理由的审计报告
-- **三种用法**：CLI / Web 界面 / HTTP API
-- **自更新**：`update` 子命令对比 GitHub 最新版自动升级
+- **零依赖**：Python 3.8+ 标准库，单文件部署， Mac mini / VPS 通吃
+- **20 条漏洞规则**：首存攻击、预言机操纵、任意 delegatecall、ERC-4626 通胀、签名重放……
+- **AI 语义复核**：静态命中 → 大模型逐条判定真漏洞/误报（OpenAI 兼容接口，默认 glm-5.3-flash）
+- **增量落盘**：扫描中断结果不丢，实时写 scan_results.json
+- **网络韧性**：AI 调用 3 次指数退避重试；代理支持（`WHITESCAN_PROXY`）
+- **Web 界面**：内置网页版（多线程、body 硬限、SSRF 白名单、可选 token 鉴权）
+- **自更新**：`update` 子命令拉 GitHub VERSION 自动升级
 
 ## 快速开始
 
 ```bash
-# 自检（验证规则库完整性）
+# 批量扫 GitHub（Compound fork 搜索）
+python3 whitescan.py scan --limit 10
+
+# 扫本地目录（递归 .sol）
+python3 whitescan.py scan --source dir --target /path/to/contracts
+
+# 扫完直连 AI 复核（只审 HIGH，最多10项）
+python3 whitescan.py scan --source dir --target ./contracts --ai
+
+# AI 复核已有结果（按严重级过滤）
+python3 whitescan.py ai scan_results.json --min-sev HIGH   # 只审含 HIGH 的
+python3 whitescan.py ai scan_results.json --min-sev MED    # 审 HIGH+MED
+python3 whitescan.py ai scan_results.json --min-sev ALL    # 全审
+
+# 自检（20/20 规则矩阵 + 边界输入）
 python3 whitescan.py selftest
 
-# 扫描 GitHub 上的借贷 fork（前5个仓库）
-python3 whitescan.py scan --limit 5
-
-# 对命中项做 AI 复核（需要 ai_key.txt）
-python3 whitescan.py ai --min-sev HIGH
-
-# 生成 Markdown 报告
-python3 whitescan.py report -o report.md
-
-# 环境自检
-python3 whitescan.py doctor
-
-# 启动 Web 界面（默认 8710 端口）
+# 网页版（默认 127.0.0.1:8710）
 python3 whitescan_web.py
 
-# 自更新到 GitHub 最新版
+# 自更新
 python3 whitescan.py update
 ```
 
-## 凭证（可选）
+## 规则表
 
-- `github_token.txt`：GitHub token，提升搜索配额（无 token 少量可用）
-- `ai_key.txt`：OpenAI 兼容 API key，用于 AI 复核
+| 规则 ID | 级别 | 说明 |
+|---|---|---|
+| `COMPOUND-V2-FIRST-DEPOSITOR` | HIGH | 第一笔存款攻击(抽干后入者) |
+| `ORACLE-SPOT-PRICE` | HIGH | 预言机spot价格操纵 |
+| `UNPROTECTED-INITIALIZER` | HIGH | 未保护initialize |
+| `ARBITRARY-DELEGATECALL` | HIGH | 任意delegatecall |
+| `UNPROTECTED-MINT` | HIGH | 未保护mint(无限增发) |
+| `REENTRANCY` | MED | 重入攻击 |
+| `SELFDESTRUCT` | MED | 未保护selfdestruct |
+| `UNCHECKED-CALL` | MED | 未检查call返回值 |
+| `INTEGER-OVERFLOW` | MED | 整数溢出(<0.8无SafeMath) |
+| `PROXY-STORAGE-COLLISION` | MED | 代理存储冲突 |
+| `TX-ORIGIN` | LOW | tx.origin鉴权 |
+| `MISSING-ZERO-CHECK` | LOW | 缺零地址检查 |
+| `BLOCK-TIMESTAMP` | LOW | 时间戳依赖 |
+| `UNCHECKED-TRANSFER` | LOW | 未检查transfer返回值 |
+| `ERC4626-INFLATION` | HIGH | ERC-4626通胀攻击 |
+| `SIGNATURE-REPLAY` | HIGH | 签名重放(缺nonce/deadline/chainId) |
+| `UNPROTECTED-CALLBACK` | HIGH | 回调未验证调用方 |
+| `WEAK-RANDOMNESS` | MED | 弱随机数 |
+| `UNBOUNDED-LOOP-DOS` | MED | 无上限循环DoS |
+| `MISSING-SWAP-DEADLINE` | LOW | swap无deadline |
 
-## 定时运行（macOS launchd）
+## 配置（环境变量 / 凭证文件）
+
+| 配置 | 说明 |
+|---|---|
+| `WHITESCAN_PROXY` | HTTP 代理（如 `http://127.0.0.1:10900`），GitHub/AI 请求全走此代理 |
+| `WHITESCAN_AI_KEY` | AI key（优先）；否则读同目录 `ai_key.txt` |
+| `WHITESCAN_AI_BASE` | OpenAI 兼容 base URL（默认 `https://api.b.ai/v1`） |
+| `WHITESCAN_AI_MODEL` | 模型名（默认 `glm-5.3-flash`） |
+| `WHITESCAN_WEB_TOKEN` | 设置后 Web /api/scan 需 token（`?token=` 或 `X-Token` 头） |
+| `github_token.txt` | 同目录，GitHub API token（提额） |
+
+## Web 版
+
+```bash
+python3 whitescan_web.py   # http://127.0.0.1:8710
+```
+
+安全设计：仅监听 127.0.0.1（公网走 nginx 反代 + 随机路径）、GitHub 域名白名单防 SSRF、
+body 500KB 硬限、GitHub 抓取串行锁 + AI 并发上限 2、可选 token 鉴权。
+
+## 定时任务（macOS launchd 示例）
+
+`com.whitescan.scan.plist` 已含绝对路径 + 代理环境变量，每日 10:00 自动扫描：
 
 ```bash
 cp com.whitescan.scan.plist ~/Library/LaunchAgents/
@@ -51,4 +97,8 @@ launchctl load ~/Library/LaunchAgents/com.whitescan.scan.plist
 
 ## 免责声明
 
-仅供安全研究与授权测试使用。
+仅供授权安全研究 / 白帽漏洞赏金使用。发现漏洞请走负责任披露，勿用于非法用途。
+
+## License
+
+MIT

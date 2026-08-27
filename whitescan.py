@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WhiteScan v1.0.0 — 冷门 fork 协议批量漏洞扫描器
+WhiteScan v1.2.0 — 冷门 fork 协议批量漏洞扫描器
 ================================================
 把「老刘白帽审计方法论」做成程序：GitHub 批量找冷门 Compound/Aave fork
 → 正则特征初筛 → AI 语义深审（过滤误报）→ Markdown 报告。
@@ -38,7 +38,7 @@ def _opener():
 
 from datetime import datetime, timezone
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 VERSION_URL = "https://raw.githubusercontent.com/ufo1898/whitescan/main/VERSION"
 SELF_URL = "https://raw.githubusercontent.com/ufo1898/whitescan/main/whitescan.py"
 REPORT_DIR = os.path.expanduser("~/whitescan/reports")
@@ -84,8 +84,15 @@ def detect_selfdestruct(code):
     return None
 
 def detect_unchecked_call(code):
-    if re.search(r'\.call\(', code) and not re.search(
-            r'require\([^)]*success|require\([^)]*ok\b|if\s*\(!\s*success|if\s*\(!\s*ok', code):
+    if not re.search(r'\.call\(', code):
+        return None
+    # 守卫按语句分界(;)识别, 兼容: require(x.call(..), "err") / bool ok = x.call(..); require(ok) / if(!success)
+    guard = re.search(
+        r'require\([^;]*?\.call\s*\('
+        r'|require\([^;]*?\b(?:ok|success)\b'
+        r'|\b(?:ok|success)\s*=\s*[^;]*?\.call\s*\('
+        r'|if\s*\(\s*!?\s*(?:ok|success)\s*\)', code)
+    if not guard:
         return "低级 .call 返回值未检查，失败被静默吞掉"
     return None
 
@@ -120,8 +127,14 @@ def detect_block_timestamp(code):
     return None if pure_staleness else "block.timestamp 参与关键逻辑，矿工可小幅操纵"
 
 def detect_unchecked_transfer(code):
-    if re.search(r'\.transfer\(|\.send\(', code) and not re.search(
-            r'require\([^)]*\.transfer|require\([^)]*\.send|if\s*\([^)]*\.transfer|if\s*\([^)]*\.send', code):
+    if not re.search(r'\.transfer\(|\.send\(', code):
+        return None
+    # 守卫按语句分界(;)识别, 兼容: require(x.send(..)) / bool ok = x.send(..); require(ok) / if(!x.send(..))
+    guard = re.search(
+        r'require\([^;]*?\.(?:transfer|send)\s*\('
+        r'|\b(?:ok|success)\s*=\s*[^;]*?\.(?:transfer|send)\s*\('
+        r'|if\s*\([^;]*?\.(?:transfer|send)\s*\)', code)
+    if not guard:
         return ".transfer/.send 返回值未检查"
     return None
 
@@ -342,32 +355,35 @@ def search_queries():
     ]
 
 def cmd_scan(args):
-    """主扫描流程: GitHub 搜索 → 逐 repo 初筛 → 结果落盘"""
+    """主扫描流程: GitHub 搜索 → 逐 repo 初筛 → 结果落盘（可选 --ai 直连复核）"""
     source = getattr(args, "source", "github")
     target = getattr(args, "target", None)
     limit = getattr(args, "limit", 50)
-    repos = []  # (repo, stars)
+    repos = []  # (repo, stars, path, hits)
 
     if source == "dir":
         if not target or not os.path.isdir(target):
             print(json.dumps({"error": f"目录不存在: {target}"}, ensure_ascii=False))
             return 2
-        for fn in sorted(os.listdir(target)):
-            if fn.endswith(".sol"):
-                p = os.path.join(target, fn)
+        for root, _dirs, files in os.walk(target):  # 递归子目录
+            for fn in sorted(files):
+                if not fn.endswith(".sol"):
+                    continue
+                p = os.path.join(root, fn)
                 try:
                     code = open(p, encoding="utf-8", errors="ignore").read()
                 except OSError:
                     continue
                 hits = scan_code(code)
                 if hits:
-                    print(f"🔴 {fn}")
+                    print(f"🔴 {os.path.relpath(p, target)}")
                     for h in hits:
                         print(f"   └─ [{h['sev']}] {h['id']}: {h['desc']}")
-                    repos.append((fn, 0, p, hits))
+                    repos.append((os.path.relpath(p, target), 0, p, hits))
         out = [{"repo": r[0], "stars": 0, "file": r[2], "hits": r[3]} for r in repos]
         _save_results(out)
-        return 0
+        print(f"\n=== 完成: 扫描目录 {target}, 命中 {len(out)} (落盘 {RESULTS_PATH}) ===")
+        return _maybe_ai_after_scan(args, out)
 
     queries = search_queries()
     seen = set()
@@ -400,7 +416,7 @@ def cmd_scan(args):
     out = [{"repo": r[0], "stars": r[1], "file": r[2], "hits": r[3]} for r in repos]
     _save_results(out)
     print(f"\n=== 完成: 扫 {len(seen)} repo, 命中 {len(out)} (落盘 {RESULTS_PATH}) ===", flush=True)
-    return 0
+    return _maybe_ai_after_scan(args, out)
 
 def _save_results(records):
     os.makedirs(os.path.dirname(RESULTS_PATH), exist_ok=True)
@@ -414,8 +430,27 @@ def _now():
 # AI 语义深审层（b.ai 免费 glm-5.3）
 # ============================================================
 
+def _http_json(req, timeout, retries=3):
+    """带重试的 HTTP JSON 请求: 网络/5xx/429 指数退避重试, 4xx 直接失败"""
+    last_err = None
+    for attempt in range(retries):
+        try:
+            with _opener().open(req, timeout=timeout) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            if 400 <= e.code < 500 and e.code != 429:
+                raise  # 客户端错误(key错/参数错)重试无意义
+            last_err = f"HTTP {e.code}"
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {str(e)[:80]}"
+        if attempt < retries - 1:
+            wait = 2 ** attempt * 2  # 2s, 4s
+            print(f"  [请求失败({last_err}), {wait}s 后重试 {attempt+2}/{retries}]", flush=True)
+            time.sleep(wait)
+    raise RuntimeError(f"重试{retries}次仍失败: {last_err}")
+
 def ai_review(code, hits, base_url, api_key, model):
-    """调 OpenAI 兼容 API 让大模型复核命中，返回 verdict 列表"""
+    """调 OpenAI 兼容 API 让大模型复核命中，返回 verdict 列表（含重试+退避）"""
     system = (
         "你是资深智能合约安全审计员。用户给出 Solidity 合约源码和静态扫描的命中列表。"
         "请逐条判定每个命中是真漏洞还是误报，重点看：权限控制、资金路径、修复特征。"
@@ -431,8 +466,7 @@ def ai_review(code, hits, base_url, api_key, model):
     req = urllib.request.Request(
         base_url.rstrip("/") + "/chat/completions", data=payload,
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"})
-    with _opener().open(req, timeout=AI_TIMEOUT) as resp:
-        data = json.loads(resp.read())
+    data = _http_json(req, timeout=AI_TIMEOUT)
     content = data["choices"][0]["message"].get("content") or ""
     if not content.strip():
         raise ValueError("AI 输出为空(推理耗尽输出预算)，加大 max_tokens 或换模型")
@@ -443,12 +477,33 @@ def ai_review(code, hits, base_url, api_key, model):
     parsed = json.loads(m.group(0))
     return parsed.get("verdicts", [])
 
+def _maybe_ai_after_scan(args, records):
+    """scan --ai: 扫完直接对命中项目跑 AI 复核（复用 cmd_ai 逻辑）"""
+    if not getattr(args, "ai", False) or not records:
+        return 0
+    print(f"\n=== 直连 AI 复核 (前 {getattr(args, 'max', 10) or 10} 项) ===", flush=True)
+    ns = argparse.Namespace(scan_file=RESULTS_PATH, max=getattr(args, "max", 10),
+                            min_sev=getattr(args, "min_sev", "HIGH"))
+    return cmd_ai(ns)
+
 def cmd_ai(args):
-    """对 scan 结果做 AI 复核，只审 HIGH 或 --all"""
+    """对 scan 结果做 AI 复核，只审 HIGH 或 --all/--min-sev 指定级别"""
     path = args.scan_file
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
     records = data.get("results", data) if isinstance(data, dict) else data
+
+    min_sev = getattr(args, "min_sev", "HIGH") or "HIGH"
+    if min_sev == "ALL":
+        targets = records
+    elif min_sev == "HIGH":
+        targets = [r for r in records if any(h.get("sev") == "HIGH" for h in r.get("hits", []))]
+    else:  # MED: HIGH + MED
+        targets = [r for r in records
+                   if any(h.get("sev") in ("HIGH", "MED") for h in r.get("hits", []))]
+    skipped = len(records) - len(targets)
+    if skipped:
+        print(f"[按严重级 {min_sev} 过滤: 审 {len(targets)} 项, 跳过 {skipped} 项]", flush=True)
 
     base_url = os.environ.get("WHITESCAN_AI_BASE", "https://api.b.ai/v1")
     api_key = os.environ.get("WHITESCAN_AI_KEY") or _load_ai_key()
@@ -459,7 +514,7 @@ def cmd_ai(args):
 
     max_n = getattr(args, "max", 10) or 10
     reviewed = 0
-    for rec in records[:max_n]:
+    for rec in targets[:max_n]:
         code = None
         file_path = rec.get("file") or ""
         if file_path.startswith("/"):
@@ -630,7 +685,319 @@ def cmd_update(args):
     return 0
 
 # ============================================================
-# 规则自测（关键：首存攻击样例必须命中）
+# 规则自测矩阵（每条规则: 漏洞样例必中 + 安全样例零误报）
+SAMPLE_ORACLE_V = """
+pragma solidity ^0.8.19;
+contract OracleUser {
+    IUniswapV2Pair immutable pair;
+    function tokenPrice() external view returns (uint) {
+        (uint r0, uint r1, ) = pair.getReserves();
+        return r1 * 1e18 / r0;
+    }
+}
+"""
+SAMPLE_ORACLE_S = """
+pragma solidity ^0.8.19;
+contract OracleUserSafe {
+    AggregatorV3Interface immutable feed;
+    function tokenPrice() external view returns (uint) {
+        (, int256 answer, , , ) = feed.latestRoundData();
+        return uint256(answer);
+    }
+}
+"""
+SAMPLE_INITIALIZER_V = """
+pragma solidity ^0.8.19;
+contract Market {
+    address public admin;
+    function initialize(address _admin) external { admin = _admin; }
+}
+"""
+SAMPLE_INITIALIZER_S = """
+pragma solidity ^0.8.19;
+contract MarketSafe {
+    address public admin;
+    function initialize(address _admin) external initializer { admin = _admin; }
+}
+"""
+SAMPLE_DELEGATE_V = """
+pragma solidity ^0.8.19;
+contract Executor {
+    function execute(address target, bytes calldata data) external nonReentrant {
+        target.delegatecall(abi.encodeWithSignature("mint(address,uint256)", msg.sender, 1e24));
+    }
+}
+"""
+SAMPLE_DELEGATE_S = """
+pragma solidity ^0.8.19;
+contract ExecutorSafe {
+    address immutable ROUTER;
+    constructor(address router) { ROUTER = router; }
+    function execute(bytes calldata data) external nonReentrant {
+        ROUTER.delegatecall(data);
+    }
+}
+"""
+SAMPLE_MINT_V = """
+pragma solidity ^0.8.19;
+contract Gold {
+    uint public totalSupply;
+    mapping(address => uint) public balanceOf;
+    function mint(address to, uint amt) external {
+        balanceOf[to] += amt;
+        totalSupply += amt;
+    }
+}
+"""
+SAMPLE_MINT_S = """
+pragma solidity ^0.8.19;
+contract GoldSafe {
+    uint public totalSupply;
+    mapping(address => uint) public balanceOf;
+    function mint(address to, uint amt) external onlyOwner {
+        balanceOf[to] += amt;
+        totalSupply += amt;
+    }
+}
+"""
+SAMPLE_REENTRANCY_V = """
+pragma solidity ^0.8.19;
+contract Vault {
+    mapping(address => uint) public balances;
+    function withdraw() external {
+        uint amt = balances[msg.sender];
+        (bool ok, ) = msg.sender.call{value: amt}("");
+        require(ok, "transfer failed");
+        balances[msg.sender] = 0;
+    }
+}
+"""
+SAMPLE_REENTRANCY_S = """
+pragma solidity ^0.8.19;
+contract VaultSafe {
+    mapping(address => uint) public balances;
+    function withdraw() external nonReentrant {
+        uint amt = balances[msg.sender];
+        (bool ok, ) = msg.sender.call{value: amt}("");
+        require(ok, "transfer failed");
+        balances[msg.sender] = 0;
+    }
+}
+"""
+SAMPLE_KILL_V = """
+pragma solidity ^0.8.19;
+contract Legacy {
+    function kill() external { selfdestruct(payable(msg.sender)); }
+}
+"""
+SAMPLE_KILL_S = """
+pragma solidity ^0.8.19;
+contract LegacySafe {
+    address owner;
+    function kill() external onlyOwner { selfdestruct(payable(owner)); }
+}
+"""
+SAMPLE_UCALL_V = """
+pragma solidity ^0.8.19;
+contract Notifier {
+    function notify(address to, bytes calldata data) external nonReentrant {
+        to.call(data);
+    }
+}
+"""
+SAMPLE_UCALL_S = """
+pragma solidity ^0.8.19;
+contract NotifierSafe {
+    function notify(address to, bytes calldata data) external nonReentrant {
+        (bool ok, ) = to.call(data);
+        require(ok, "notify failed");
+    }
+}
+"""
+SAMPLE_OVERFLOW_V = """
+pragma solidity ^0.7.6;
+contract OldToken {
+    uint public totalSupply;
+    function burn(uint amt) external { totalSupply -= amt; }
+}
+"""
+SAMPLE_OVERFLOW_S = """
+pragma solidity ^0.7.6;
+import "./SafeMath.sol";
+contract OldTokenSafe {
+    using SafeMath for uint256;
+    uint public totalSupply;
+    function burn(uint amt) external { totalSupply = totalSupply.sub(amt); }
+}
+"""
+SAMPLE_PROXY_V = """
+pragma solidity ^0.8.19;
+contract VaultProxy {
+    address public admin;
+    address immutable implementation;
+    function initialize(address _admin) external initializer { admin = _admin; }
+    fallback() external payable { implementation.delegatecall(msg.data); }
+}
+"""
+SAMPLE_PROXY_S = """
+pragma solidity ^0.8.19;
+contract VaultProxySafe {
+    address immutable implementation;
+    constructor(address impl) { implementation = impl; }
+    fallback() external payable { implementation.delegatecall(msg.data); }
+}
+"""
+SAMPLE_TXORIGIN_V = """
+pragma solidity ^0.8.19;
+contract Auth {
+    address owner;
+    function claim() external {
+        require(tx.origin == owner, "not owner");
+    }
+}
+"""
+SAMPLE_TXORIGIN_S = """
+pragma solidity ^0.8.19;
+contract AuthSafe {
+    address owner;
+    function claim() external {
+        require(msg.sender == owner, "not owner");
+    }
+}
+"""
+SAMPLE_ZERO_V = """
+pragma solidity ^0.8.19;
+contract FeeConfig {
+    address feeRecipient;
+    function setFeeRecipient(address who) external onlyOwner { feeRecipient = who; }
+}
+"""
+SAMPLE_ZERO_S = """
+pragma solidity ^0.8.19;
+contract FeeConfigSafe {
+    address feeRecipient;
+    function setFeeRecipient(address who) external onlyOwner {
+        require(who != address(0), "zero addr");
+        feeRecipient = who;
+    }
+}
+"""
+SAMPLE_TS_V = """
+pragma solidity ^0.8.19;
+contract DrawGame {
+    address[] players;
+    function drawWinner() external returns (address) {
+        uint idx = block.timestamp % players.length;
+        return players[idx];
+    }
+}
+"""
+SAMPLE_TS_S = """
+pragma solidity ^0.8.19;
+contract OracleLib {
+    function isFresh(uint lastUpdated) external view returns (bool) {
+        return block.timestamp - lastUpdated <= 3600;
+    }
+}
+"""
+SAMPLE_UTRANSFER_V = """
+pragma solidity ^0.8.19;
+contract Distributor {
+    function payout(address to, uint amt) external nonReentrant {
+        payable(to).transfer(amt);
+    }
+}
+"""
+SAMPLE_UTRANSFER_S = """
+pragma solidity ^0.8.19;
+contract DistributorSafe {
+    function payout(address to, uint amt) external nonReentrant {
+        require(payable(to).send(amt), "payout failed");
+    }
+}
+"""
+SAMPLE_4626_SAFE = """
+pragma solidity ^0.8.20;
+contract Vault4626Safe is IERC4626 {
+    uint public totalSupply;
+    uint constant DECIMAL_OFFSET = 6;
+    function _convertToShares(uint assets) internal view returns (uint) {
+        return assets * (totalSupply + 10 ** DECIMAL_OFFSET) / totalAssets();
+    }
+}
+"""
+SAMPLE_RAND_V = """
+pragma solidity ^0.8.19;
+contract SeedGame {
+    address[] players;
+    function winner() external view returns (address) {
+        uint seed = uint(keccak256(abi.encodePacked(block.difficulty, block.number, players.length)));
+        return players[seed % players.length];
+    }
+}
+"""
+SAMPLE_RAND_S = """
+pragma solidity ^0.8.19;
+contract SeedGameSafe {
+    address[] players;
+    mapping(uint256 => address) winners;
+    function fulfillRandomWords(uint256 requestId, uint256[] calldata randomWords) internal {
+        winners[requestId] = players[randomWords[0] % players.length];
+    }
+}
+"""
+SAMPLE_LOOP_V = """
+pragma solidity ^0.8.19;
+contract Registry {
+    address[] borrowers;
+    mapping(address => uint) debts;
+    function totalDebt() external view returns (uint) {
+        uint sum;
+        for (uint i = 0; i < borrowers.length; i++) {
+            sum += debts[borrowers[i]];
+        }
+        return sum;
+    }
+}
+"""
+SAMPLE_LOOP_S = """
+pragma solidity ^0.8.19;
+contract RegistrySafe {
+    uint constant MAX_BORROWERS = 5000;
+    address[] borrowers;
+    mapping(address => uint) debts;
+    function addBorrower(address who) external {
+        require(borrowers.length < MAX_BORROWERS);
+        borrowers.push(who);
+    }
+    function totalDebt() external view returns (uint) {
+        uint sum;
+        for (uint i = 0; i < borrowers.length; i++) { sum += debts[borrowers[i]]; }
+        return sum;
+    }
+}
+"""
+SAMPLE_SWAPDL_V = """
+pragma solidity ^0.8.19;
+contract ArbBot {
+    ISwapRouter immutable router;
+    function swap(address tokenOut, uint amountIn) external {
+        router.exactInputSingle(ISwapRouter.ExactInputSingleParams({
+            tokenIn: WETH, tokenOut: tokenOut, fee: 3000, recipient: msg.sender,
+            amountIn: amountIn, amountOutMinimum: 0, sqrtPriceLimitX96: 0}));
+    }
+}
+"""
+SAMPLE_SWAPDL_S = """
+pragma solidity ^0.8.19;
+contract ArbBotSafe {
+    IUniswapV2Router immutable router;
+    function swap(address tokenOut, uint amountIn, uint deadline) external {
+        address[] memory p = new address[](2);
+        router.swapExactTokensForTokens(amountIn, 1, p, msg.sender, deadline);
+    }
+}
+"""
 # ============================================================
 
 SAMPLE_VULN = """
@@ -711,28 +1078,58 @@ contract ClaimSafe {
 }
 """
 
+# 全规则测试矩阵: (规则id, 漏洞样例, 安全样例) — 覆盖率不足 selftest 直接失败
+RULE_TESTS = [
+    ("COMPOUND-V2-FIRST-DEPOSITOR", SAMPLE_VULN,            SAMPLE_FIXED),
+    ("ORACLE-SPOT-PRICE",           SAMPLE_ORACLE_V,        SAMPLE_ORACLE_S),
+    ("UNPROTECTED-INITIALIZER",     SAMPLE_INITIALIZER_V,   SAMPLE_INITIALIZER_S),
+    ("ARBITRARY-DELEGATECALL",      SAMPLE_DELEGATE_V,      SAMPLE_DELEGATE_S),
+    ("UNPROTECTED-MINT",            SAMPLE_MINT_V,          SAMPLE_MINT_S),
+    ("REENTRANCY",                  SAMPLE_REENTRANCY_V,    SAMPLE_REENTRANCY_S),
+    ("SELFDESTRUCT",                SAMPLE_KILL_V,          SAMPLE_KILL_S),
+    ("UNCHECKED-CALL",              SAMPLE_UCALL_V,         SAMPLE_UCALL_S),
+    ("INTEGER-OVERFLOW",            SAMPLE_OVERFLOW_V,      SAMPLE_OVERFLOW_S),
+    ("PROXY-STORAGE-COLLISION",     SAMPLE_PROXY_V,         SAMPLE_PROXY_S),
+    ("TX-ORIGIN",                   SAMPLE_TXORIGIN_V,      SAMPLE_TXORIGIN_S),
+    ("MISSING-ZERO-CHECK",          SAMPLE_ZERO_V,          SAMPLE_ZERO_S),
+    ("BLOCK-TIMESTAMP",             SAMPLE_TS_V,            SAMPLE_TS_S),
+    ("UNCHECKED-TRANSFER",          SAMPLE_UTRANSFER_V,     SAMPLE_UTRANSFER_S),
+    ("ERC4626-INFLATION",           SAMPLE_4626,            SAMPLE_4626_SAFE),
+    ("SIGNATURE-REPLAY",            SAMPLE_SIG_REPLAY,      SAMPLE_SIG_FIXED),
+    ("UNPROTECTED-CALLBACK",        SAMPLE_CALLBACK_VULN,   SAMPLE_CALLBACK_FIXED),
+    ("WEAK-RANDOMNESS",             SAMPLE_RAND_V,          SAMPLE_RAND_S),
+    ("UNBOUNDED-LOOP-DOS",          SAMPLE_LOOP_V,          SAMPLE_LOOP_S),
+    ("MISSING-SWAP-DEADLINE",       SAMPLE_SWAPDL_V,        SAMPLE_SWAPDL_S),
+]
+
 def self_test():
-    # 1. 首存攻击: 必须命中
-    vuln_hits = {h["id"] for h in scan_code(SAMPLE_VULN)}
-    assert "COMPOUND-V2-FIRST-DEPOSITOR" in vuln_hits, f"首存攻击样例未命中! 实际: {vuln_hits}"
-    # 2. 修复样例: 不许误报
-    fixed_hits = {h["id"] for h in scan_code(SAMPLE_FIXED)}
-    assert "COMPOUND-V2-FIRST-DEPOSITOR" not in fixed_hits, "修复样例误报!"
-    # 3. ERC-4626 通胀
-    h4626 = {h["id"] for h in scan_code(SAMPLE_4626)}
-    assert "ERC4626-INFLATION" in h4626, f"4626样例未命中! 实际: {h4626}"
-    # 4. 回调无验证: 漏洞版命中, 安全版不命中
-    hcb = {h["id"] for h in scan_code(SAMPLE_CALLBACK_VULN)}
-    assert "UNPROTECTED-CALLBACK" in hcb, f"回调样例未命中! 实际: {hcb}"
-    hcb_fix = {h["id"] for h in scan_code(SAMPLE_CALLBACK_FIXED)}
-    assert "UNPROTECTED-CALLBACK" not in hcb_fix, "回调安全样例误报!"
-    # 5. 签名重放: 漏洞版命中, 安全版不命中
-    hsig = {h["id"] for h in scan_code(SAMPLE_SIG_REPLAY)}
-    assert "SIGNATURE-REPLAY" in hsig, f"签名样例未命中! 实际: {hsig}"
-    hsig_fix = {h["id"] for h in scan_code(SAMPLE_SIG_FIXED)}
-    assert "SIGNATURE-REPLAY" not in hsig_fix, "签名安全样例误报!"
-    print(f"✅ 规则自测通过({len(VULN_RULES)}条): 首存攻击/4626通胀/回调仿冒/签名重放 全命中, "
-          f"3个安全样例 0 误报")
+    """全规则测试矩阵: 漏洞样例必中 + 安全样例零误报 + 边界输入不崩"""
+    tested = {rid for rid, _, _ in RULE_TESTS}
+    missing = [r[0] for r in VULN_RULES if r[0] not in tested]
+    if missing:
+        print(f"❌ 自测矩阵缺规则样例: {missing}")
+        raise SystemExit(1)
+    fails = []
+    for rid, vuln, safe in RULE_TESTS:
+        vh = {h["id"] for h in scan_code(vuln)}
+        sh = {h["id"] for h in scan_code(safe)}
+        if rid not in vh:
+            fails.append(f"{rid} 漏洞样例未命中 (实际命中: {sorted(vh) or '无'})")
+        if rid in sh:
+            fails.append(f"{rid} 安全样例误报 (命中: {sorted(sh)})")
+    # 边界: 空输入/非Solidity/超长输入必须安全返回不崩
+    for edge, label in (("", "空输入"), ("hello world, not solidity", "非Solidity"),
+                        ("x" * 600_000, "600KB超长输入")):
+        try:
+            scan_code(edge)
+        except Exception as e:
+            fails.append(f"边界用例[{label}] 异常: {type(e).__name__}: {e}")
+    if fails:
+        for f in fails:
+            print("❌", f)
+        raise SystemExit(1)
+    print(f"✅ 规则自测通过: 矩阵 {len(RULE_TESTS)}/{len(VULN_RULES)} 条规则全覆盖, "
+          f"漏洞样例全命中, 安全样例目标规则 0 误报, 边界输入 3/3 不崩")
 
 # ============================================================
 # CLI
@@ -747,11 +1144,17 @@ def main():
     p_scan.add_argument("--source", choices=["github", "dir"], default="github")
     p_scan.add_argument("--target", help="source=dir 时的目录")
     p_scan.add_argument("--limit", type=int, default=30, help="每个 query 取多少 repo")
+    p_scan.add_argument("--ai", action="store_true", help="扫完直连 AI 复核命中项")
+    p_scan.add_argument("--max", type=int, default=10, help="AI 复核最多审几个项目")
+    p_scan.add_argument("--min-sev", choices=["HIGH", "MED", "ALL"], default="HIGH",
+                        dest="min_sev", help="AI 复核最低严重级(默认 HIGH)")
     p_scan.set_defaults(func=cmd_scan)
 
     p_ai = sub.add_parser("ai", help="AI 语义复核 scan 结果")
     p_ai.add_argument("scan_file", nargs="?", default=RESULTS_PATH)
     p_ai.add_argument("--max", type=int, default=10, help="最多审几个项目")
+    p_ai.add_argument("--min-sev", choices=["HIGH", "MED", "ALL"], default="HIGH",
+                      dest="min_sev", help="只审含该级别以上的项目(默认 HIGH)")
     p_ai.set_defaults(func=cmd_ai)
 
     p_rep = sub.add_parser("report", help="生成 Markdown 报告")

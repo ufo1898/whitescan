@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.8", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Selftest (20规则矩阵 + 边界)
+        run: python3 whitescan.py selftest
+      - name: CLI smoke
+        run: |
+          python3 whitescan.py --version
+          python3 whitescan.py scan --help
+          python3 whitescan.py ai --help
+      - name: Web import check
+        run: python3 -c "import ast; ast.parse(open('whitescan_web.py').read()); print('web syntax OK')"

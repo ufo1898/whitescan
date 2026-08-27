@@ -1,0 +1,46 @@
+# Changelog
+
+本文件记录 WhiteScan 的版本变更。格式参考 Keep a Changelog。
+
+## [1.2.0] - 2026-08-28
+
+### Added
+- 全规则测试矩阵：selftest 覆盖 20/20 条规则（漏洞样例必中 + 安全样例零误报 + 覆盖率断言），规则数与矩阵数不符直接失败
+- 边界测试：空输入 / 非 Solidity 文本 / 600KB 超长输入不崩溃
+- AI 调用重试：网络错误 / 5xx / 429 指数退避重试 3 次，4xx 立即失败（`_http_json`）
+- `scan --ai`：扫描完成直连 AI 复核命中项，一条命令出最终结论
+- `scan/ai --min-sev HIGH|MED|ALL`：按严重级过滤 AI 复核对象，省 token
+- `scan --source dir` 递归子目录扫描（此前只扫顶层）
+- Web 版 token 鉴权（`WHITESCAN_WEB_TOKEN`，query 参数或 X-Token 头）
+- Web 版请求体 500KB 硬限 + Content-Length 强制校验（超限 413）
+- GitHub Actions CI：push/PR 自动跑 selftest（3.8/3.11/3.12 三版本矩阵）
+- README 规则表 + 完整用法文档
+
+### Changed
+- Web 服务改 `ThreadingHTTPServer`（此前单线程，一个慢请求卡死全部）
+- Web 并发保护：GitHub 抓取串行锁（配额保护）、AI 复核并发上限 2、总并发 16
+- `UNCHECKED-CALL` / `UNCHECKED-TRANSFER` 守卫正则改按语句分界（`;`）匹配，`require(x.call(...))` 内联写法不再漏报
+
+### Fixed
+- **Web 自死锁**：`threading.Lock` 不可重入，do_POST 与 fetch_code_from_input 同线程二次加锁导致永久挂起 —— 锁职责统一收归 HTTP 层
+- **AI 复核 --min-sev 失效**：targets 过滤后循环仍遍历全量 records，过滤形同虚设
+- Web URL 抓取绕过代理：改走 `ws._opener()`（修复 008 等代理环境）
+- 401 等客户端错误不再无意义重试
+
+## [1.1.1] - 2026-08-27
+
+### Added
+- `VERSION` 文件 + `update` 自更新子命令（拉 GitHub raw 比对版本）
+- `WHITESCAN_PROXY` 代理支持：8 处 urlopen 全走 `_opener()`（ProxyHandler）
+- Web 版（whitescan_web.py）：贴码 / repo / URL 三种输入 + AI 复核
+
+### Changed
+- 版本号统一 v1.1.1
+
+## [1.1.0] - 2026-08-27
+
+### Added
+- GitHub 首次发布：whitescan.py + whitescan_web.py + launchd plist
+- 14 → 20 条漏洞规则（ERC-4626 通胀 / 签名重放 / 回调未验证 / 弱随机 / 循环 DoS / swap deadline）
+- AI 语义复核层（b.ai glm-5.3-flash）
+- 本地目录扫描 / Markdown 报告 / selftest

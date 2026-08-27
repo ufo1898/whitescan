@@ -1,42 +1,52 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WhiteScan Web v1.1.1 — 网页版漏洞扫描器
+WhiteScan Web v1.2.0 — 网页版漏洞扫描器
 =======================================
 标准库 http.server 实现（无 pip 依赖，008 Mac 直接跑）。
 复用 whitescan.py 的规则引擎 + GitHub 探测 + AI 深审。
 
 端点:
   GET  /                     前端页面
-  POST /api/scan             body: {"target": "owner/repo 或 https://github.com/... 或 URL 或 ''(批量搜索)"}
-  GET  /api/status           健康+版本
-  GET  /api/results          最近扫描结果
+  POST /api/scan             body: {"target": "owner/repo 或 URL 或 Solidity源码", "ai": bool}
+  GET  /api/status           健康+版本（无鉴权，供监控）
+  GET  /api/results          最近批量扫描结果
 
 安全:
   - 只监听 127.0.0.1（公网走 nginx 反代 + 随机路径）
   - 仅放行 GitHub 域名的 raw 请求（防 SSRF）
+  - body 硬上限 500KB（超限 413），Content-Length 必须声明
+  - 并发限制: GitHub 抓取串行（配额保护），AI 复核最多 2 并发
+  - 可选 token 鉴权: 设 WHITESCAN_WEB_TOKEN 后 /api/scan 与 /api/results
+    需带 X-Token 头或 ?token= 参数（默认关闭，随机路径本身即凭证）
 """
 import json
 import os
 import re
 import sys
 import threading
-import time
 import urllib.request
 import urllib.parse
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import whitescan as ws  # 复用规则引擎
 
 HOST = os.environ.get("WHITESCAN_WEB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("WHITESCAN_WEB_PORT", "8710"))
-MAX_CODE_SIZE = 500_000  # 500KB 上限防内存炸弹
+WEB_TOKEN = os.environ.get("WHITESCAN_WEB_TOKEN", "").strip()
+MAX_CODE_SIZE = 500_000          # 500KB 上限防内存炸弹
+MAX_BODY = MAX_CODE_SIZE + 10_000  # JSON 包装余量
 
 # 允许抓取的域名白名单（SSRF 防护）
 ALLOWED_HOSTS = {"raw.githubusercontent.com", "github.com", "api.github.com", "gist.githubusercontent.com"}
 
-_scan_lock = threading.Lock()  # GitHub API 配额保护, 串行化扫描
+_gh_lock = threading.Lock()      # GitHub API 配额保护, 抓取串行
+_ai_sem = threading.BoundedSemaphore(2)  # AI 复核并发上限
+
+
+def looks_like_source(s):
+    return "contract " in s or "pragma solidity" in s
 
 
 def fetch_code_from_input(user_input):
@@ -44,8 +54,8 @@ def fetch_code_from_input(user_input):
     user_input = (user_input or "").strip()
     if not user_input:
         return None, "空输入"
-    # 1. 直接贴源码（含 contract 关键字 + 换行 = 当源码）
-    if "contract " in user_input or "pragma solidity" in user_input:
+    # 1. 直接贴源码
+    if looks_like_source(user_input):
         if len(user_input) > MAX_CODE_SIZE:
             return None, "源码超 500KB"
         return user_input, None
@@ -56,14 +66,18 @@ def fetch_code_from_input(user_input):
             return None, f"只允许 GitHub 域名, 拒绝: {p.hostname}"
         try:
             req = urllib.request.Request(user_input, headers={"User-Agent": "whitescan"})
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                code = resp.read().decode("utf-8", "ignore")
-            return (code[:MAX_CODE_SIZE], None) if code else (None, "URL 内容为空")
+            with ws._opener().open(req, timeout=20) as resp:  # 走代理 opener(008必需)
+                code = resp.read(MAX_CODE_SIZE + 1).decode("utf-8", "ignore")
+            if len(code) > MAX_CODE_SIZE:
+                return None, "URL 内容超 500KB"
+            return (code, None) if code else (None, "URL 内容为空")
         except Exception as e:
             return None, f"抓取失败: {str(e)[:100]}"
     # 3. owner/repo → GitHub 找核心借贷文件
+    #    注意: 不在此处加锁, gh_lock 的获取/释放统一由 HTTP 层(do_POST)管理,
+    #    避免 threading.Lock 非重入导致同线程二次 acquire 自死锁。
     if re.match(r'^[\w.-]+/[\w.-]+$', user_input):
-        repo = user_input.replace("https://github.com/", "").strip("/")
+        repo = user_input.strip("/")
         path, code = ws.discover_lending_files(repo)
         if not code:
             return None, f"{repo} 里没找到 CToken/Comptroller 等核心借贷文件"
@@ -71,34 +85,53 @@ def fetch_code_from_input(user_input):
     return None, "无法识别输入: 给 owner/repo、raw URL 或直接贴 Solidity 源码"
 
 
+def _check_token(handler):
+    """校验 token（配置了才启用）。query 参数优先（方便 curl），其次 X-Token 头"""
+    if not WEB_TOKEN:
+        return True
+    q = urllib.parse.urlparse(handler.path).query
+    provided = urllib.parse.parse_qs(q).get("token", [""])[0] or handler.headers.get("X-Token", "")
+    return provided == WEB_TOKEN
+
+
 class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "WhiteScanWeb"
+    # nginx 反代已有随机路径防护, 这里限并发防极端情况
+    max_concurrent = threading.BoundedSemaphore(16)
+
     def log_message(self, fmt, *args):
         pass  # 静默，日志走 stdout 由 systemd 收
 
-    def _json(self, obj, status=200):
-        body = json.dumps(obj, ensure_ascii=False).encode()
+    def _send(self, body, status=200, ctype="application/json; charset=utf-8"):
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body, ensure_ascii=False).encode()
+        elif isinstance(body, str):
+            body = body.encode()
         self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # 客户端提前断开(如curl超时), 不算错误
 
-    def _html(self, html):
-        body = html.encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-        self.wfile.write(body)
+    def _json(self, obj, status=200):
+        self._send(obj, status)
 
     def do_GET(self):
-        if self.path in ("/", ""):
-            self._html(PAGE_HTML)
-        elif self.path == "/api/status":
-            self._json({"ok": True, "version": ws.__version__, "rules": len(ws.VULN_RULES)})
-        elif self.path == "/api/results":
+        path = urllib.parse.urlparse(self.path).path
+        if path in ("/", ""):
+            self._send(PAGE_HTML, ctype="text/html; charset=utf-8")
+        elif path == "/api/status":
+            self._json({"ok": True, "version": ws.__version__, "rules": len(ws.VULN_RULES),
+                        "auth": bool(WEB_TOKEN)})
+        elif path == "/api/results":
+            if not _check_token(self):
+                self._json({"error": "需要 token"}, 401)
+                return
             try:
                 with open(ws.RESULTS_PATH) as f:
                     self._json(json.load(f))
@@ -108,20 +141,34 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "not found"}, 404)
 
     def do_POST(self):
-        if self.path != "/api/scan":
+        path = urllib.parse.urlparse(self.path).path
+        if path != "/api/scan":
             self._json({"error": "not found"}, 404)
             return
+        if not _check_token(self):
+            self._json({"error": "需要 token"}, 401)
+            return
+        # body 大小硬限: 必须声明 Content-Length 且 ≤ MAX_BODY
         try:
-            length = min(int(self.headers.get("Content-Length", "0")), MAX_CODE_SIZE + 10000)
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            self._json({"error": "缺少 Content-Length"}, 400)
+            return
+        if length <= 0 or length > MAX_BODY:
+            self._json({"error": f"body 大小非法(上限 {MAX_BODY} 字节)"}, 413)
+            return
+        try:
             payload = json.loads(self.rfile.read(length))
         except Exception:
             self._json({"error": "bad json"}, 400)
             return
-        user_input = payload.get("target", "")
+        user_input = str(payload.get("target", ""))
         want_ai = bool(payload.get("ai", False))
 
-        if not _scan_lock.acquire(blocking=False):
-            self._json({"error": "有扫描正在进行, 稍后再试"}, 429)
+        # 贴码扫描不占 GitHub 配额锁, 只有 repo/URL 抓取需要
+        need_gh_lock = not looks_like_source(user_input)
+        if need_gh_lock and not _gh_lock.acquire(blocking=False):
+            self._json({"error": "有 GitHub 抓取进行中, 稍后再试"}, 429)
             return
         try:
             code, err = fetch_code_from_input(user_input)
@@ -131,28 +178,34 @@ class Handler(BaseHTTPRequestHandler):
             hits = ws.scan_code(code)
             result = {
                 "input": user_input[:120],
-                "source": "pasted" if ("contract " in user_input or "pragma solidity" in user_input) else "github",
+                "source": "pasted" if looks_like_source(user_input) else "github",
                 "lines": code.count("\n") + 1,
                 "hits": hits,
                 "ai": None,
                 "ts": ws._now(),
             }
-            # AI 深审（可选）
+            # AI 深审（可选, 并发上限 2）
             if want_ai and hits:
-                try:
-                    key = os.environ.get("WHITESCAN_AI_KEY") or ws._load_ai_key()
-                    base = os.environ.get("WHITESCAN_AI_BASE", "https://api.b.ai/v1")
-                    model = os.environ.get("WHITESCAN_AI_MODEL", "glm-5.3-flash")
-                    if key:
-                        verdicts = ws.ai_review(code, hits, base, key, model)
-                        result["ai"] = verdicts
-                    else:
-                        result["ai"] = {"error": "未配置 AI key"}
-                except Exception as e:
-                    result["ai"] = {"error": str(e)[:200]}
+                if _ai_sem.acquire(blocking=False):
+                    try:
+                        key = os.environ.get("WHITESCAN_AI_KEY") or ws._load_ai_key()
+                        base = os.environ.get("WHITESCAN_AI_BASE", "https://api.b.ai/v1")
+                        model = os.environ.get("WHITESCAN_AI_MODEL", "glm-5.3-flash")
+                        if key:
+                            verdicts = ws.ai_review(code, hits, base, key, model)
+                            result["ai"] = {"verdicts": verdicts}
+                        else:
+                            result["ai"] = {"error": "未配置 AI key"}
+                    except Exception as e:
+                        result["ai"] = {"error": str(e)[:200]}
+                    finally:
+                        _ai_sem.release()
+                else:
+                    result["ai"] = {"error": "AI 复核并发已满(2), 稍后重试或关闭 AI"}
             self._json(result)
         finally:
-            _scan_lock.release()
+            if need_gh_lock:
+                _gh_lock.release()
 
 
 PAGE_HTML = r"""<!DOCTYPE html>
@@ -178,7 +231,6 @@ input[type=text]{height:40px}
 .row{display:flex;gap:10px;margin-top:10px;align-items:center;flex-wrap:wrap}
 button{background:var(--blue);color:#fff;border:0;border-radius:6px;padding:9px 18px;font-size:14px;cursor:pointer;font-weight:600}
 button:disabled{opacity:.5;cursor:wait}
-button.ghost{background:transparent;border:1px solid var(--border);color:var(--dim);font-weight:400}
 label.chk{color:var(--dim);font-size:13px;display:flex;gap:5px;align-items:center;cursor:pointer}
 .status{font-size:12px;color:var(--dim)}
 .ex{color:var(--dim);font-size:12px;margin-top:8px}
@@ -203,7 +255,7 @@ label.chk{color:var(--dim);font-size:13px;display:flex;gap:5px;align-items:cente
 .err{color:var(--red);font-size:13px;padding:10px}
 .loading{color:var(--blue);font-size:13px;padding:10px}
 .ok{color:var(--grn)}
-#results:empty::after{content:""}
+#tokenRow{display:none}
 @media(max-width:600px){.summary{flex-wrap:wrap}}
 </style>
 </head>
@@ -213,7 +265,8 @@ label.chk{color:var(--dim);font-size:13px;display:flex;gap:5px;align-items:cente
   <div class="sub" id="rulecount">智能合约漏洞扫描 — 规则+AI 语义复核</div>
 
   <div class="card">
-    <input type="text" id="target" placeholder="owner/repo（如 uni-swap/compound-fork）或 raw.githubusercontent.com 链接" spellcheck="false">
+    <div class="row" id="tokenRow"><input type="text" id="token" placeholder="访问 Token" style="height:36px"></div>
+    <input type="text" id="target" placeholder="owner/repo（如 lend-fam/compound-fork）或 raw.githubusercontent.com 链接" spellcheck="false" style="margin-top:0">
     <textarea id="code" placeholder="…或直接粘贴 Solidity 源码"></textarea>
     <div class="row">
       <button id="scanBtn" onclick="doScan()">扫描</button>
@@ -228,6 +281,8 @@ label.chk{color:var(--dim);font-size:13px;display:flex;gap:5px;align-items:cente
   <div id="results"></div>
 </div>
 <script>
+function tok(){const t=document.getElementById('token').value.trim();return t}
+function hdrs(){const h={'Content-Type':'application/json'};const t=tok();if(t)h['X-Token']=t;return h}
 async function doScan(){
   const btn=document.getElementById('scanBtn'),st=document.getElementById('status');
   const target=document.getElementById('target').value.trim();
@@ -236,15 +291,17 @@ async function doScan(){
   btn.disabled=true;st.textContent='扫描中…';
   document.getElementById('results').innerHTML='<div class="loading">⏳ 规则扫描…'+(document.getElementById('ai').checked?' AI 复核约需 60s…':'')+'</div>';
   try{
-    const r=await fetch('/api/scan',{method:'POST',headers:{'Content-Type':'application/json'},
+    const r=await fetch('/api/scan',{method:'POST',headers:hdrs(),
       body:JSON.stringify({target:target||code,ai:document.getElementById('ai').checked})});
+    if(r.status===401){document.getElementById('tokenRow').style.display='flex';
+      document.getElementById('results').innerHTML='<div class="err">🔒 需要 Token（输入后重扫，自动记住）</div>';st.textContent='';btn.disabled=false;return}
     const d=await r.json();
     if(d.error){document.getElementById('results').innerHTML='<div class="err">❌ '+d.error+'</div>';st.textContent='';}
-    else{render(d);st.textContent='完成 '+d.ts;}
+    else{render(d);st.textContent='完成 '+d.ts;if(tok())localStorage.setItem('ws_tok',tok());}
   }catch(e){document.getElementById('results').innerHTML='<div class="err">请求失败: '+e+'</div>';}
   btn.disabled=false;
 }
-function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function esc(s){return (s||'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]))}
 function render(d){
   const el=document.getElementById('results');
   const high=d.hits.filter(h=>h.sev==='HIGH').length, med=d.hits.filter(h=>h.sev==='MED').length;
@@ -255,7 +312,7 @@ function render(d){
       <span style="color:var(--yel)">中危 <b>${med}</b></span>
       <span class="status">${esc(d.source)} · ${d.lines} 行 · ${esc(d.ts)}</span>
     </div>`;
-  if(!d.hits.length) html+='<div class="ok">✅ 20 条规则无命中（不代表无漏洞，AI 复核可见细节）</div>';
+  if(!d.hits.length) html+='<div class="ok">✅ 规则无命中（不代表无漏洞，AI 复核可见细节）</div>';
   for(const h of d.hits){
     html+=`<div class="hit ${h.sev}">
       <div class="head"><span class="rid">${esc(h.id)}</span><span class="sev ${h.sev}">${h.sev}</span></div>
@@ -278,7 +335,9 @@ function render(d){
 }
 fetch('/api/status').then(r=>r.json()).then(d=>{
   document.getElementById('ver').textContent='v'+d.version;
-  document.getElementById('rulecount').textContent=d.rules+' 条规则 + AI 语义复核';
+  document.getElementById('rulecount').textContent=d.rules+' 条规则 + AI 语义复核'+(d.auth?' · 🔒token模式':'');
+  if(d.auth){document.getElementById('tokenRow').style.display='flex';
+    const saved=localStorage.getItem('ws_tok');if(saved)document.getElementById('token').value=saved;}
 });
 </script>
 </body>
@@ -286,8 +345,10 @@ fetch('/api/status').then(r=>r.json()).then(d=>{
 
 
 def main():
-    server = HTTPServer((HOST, PORT), Handler)
-    print(f"WhiteScan Web v{ws.__version__} listening on http://{HOST}:{PORT}", flush=True)
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    server.daemon_threads = True
+    print(f"WhiteScan Web v{ws.__version__} listening on http://{HOST}:{PORT} "
+          f"(rules={len(ws.VULN_RULES)}, auth={'on' if WEB_TOKEN else 'off'})", flush=True)
     server.serve_forever()
 
 
