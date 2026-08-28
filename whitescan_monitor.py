@@ -5,7 +5,7 @@ WhiteScan Monitor — 链上新部署合约实时漏洞监控
 ==============================================
 标准库实现（无 pip 依赖，003 VPS / 008 Mac 通吃）。
 轮询 RPC 最新区块 → 提取新部署合约 → Blockscout 拉已验证源码
-→ 复用 whitescan.py 24 条规则引擎 → HIGH/MED 命中即告警。
+→ 复用 whitescan.py 规则引擎（动态载入，当前 25 条） → HIGH/MED 命中即告警。
 
 数据流:
   eth_getBlockReceipts(新块) → 筛 contractAddress≠null（覆盖普通创建+CREATE2工厂）
@@ -207,7 +207,7 @@ def fetch_verified_source(explorer_api, address, timeout=15):
 # ------------------------------------------------------------
 
 def scan_source(source_code):
-    """跑 24 条规则引擎，返回 hits（超大源码直接跳过）"""
+    """跑 whitescan.py 全部规则（动态载入，返回 hits（超大源码直接跳过）"""
     if not source_code or len(source_code) > MAX_SOURCE_BYTES:
         return []
     try:
