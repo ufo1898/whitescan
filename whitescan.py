@@ -38,7 +38,7 @@ def _opener():
 
 from datetime import datetime, timezone
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 VERSION_URL = "https://raw.githubusercontent.com/ufo1898/whitescan/main/VERSION"
 SELF_URL = "https://raw.githubusercontent.com/ufo1898/whitescan/main/whitescan.py"
 REPORT_DIR = os.path.expanduser("~/whitescan/reports")
@@ -357,20 +357,24 @@ def gh_repo_root_listing(repo):
         return []
 
 def discover_lending_files(repo):
-    """优先猜常见路径，猜不中就列根目录模糊匹配借贷协议文件"""
-    for path in TOKEN_PATHS:
-        code = gh_file_raw(repo, path)
-        if code:
-            return path, code
-    # 模糊匹配：根目录里的 .sol 文件，名字像核心合约
-    listing = gh_repo_root_listing(repo)
+    """优先猜常见路径(并发探测省时)，猜不中就列根目录模糊匹配借贷协议文件"""
+    from concurrent.futures import ThreadPoolExecutor
     keywords = ("CToken", "Comptroller", "Lending", "Lend", "Market", "Pool",
                 "Controller", "Bank", "Vault", "Borrow")
-    for item in listing:
-        if item.endswith(".sol") and any(k.lower() in item.lower() for k in keywords):
-            code = gh_file_raw(repo, item)
-            if code:
-                return item, code
+    # 先列根目录(1次API): 命中关键词直接取, 大多数fork走这条路
+    listing = gh_repo_root_listing(repo) or []
+    cand = [item for item in listing
+            if item.endswith(".sol") and any(k.lower() in item.lower() for k in keywords)]
+    for item in cand:
+        code = gh_file_raw(repo, item)
+        if code:
+            return item, code
+    # 根目录无果再并发猜常见路径(子目录 contracts/ src/)
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        results = list(pool.map(lambda p: (p, gh_file_raw(repo, p)), TOKEN_PATHS))
+    for path, code in results:
+        if code:
+            return path, code
     return None, None
 
 # ============================================================
@@ -403,6 +407,12 @@ def search_queries():
         "aave v2 fork language:Solidity",
         "lending protocol fork solidity language:Solidity",
         "defi lending borrow solidity fork",
+        "uniswap v2 fork language:Solidity stars:<50",
+        "pancakeswap fork language:Solidity stars:<50",
+        "masterchef vault solidity language:Solidity stars:<50",
+        "yield farming staking solidity language:Solidity stars:<30",
+        "presale token sale solidity language:Solidity stars:<30",
+        "bridge locker solidity language:Solidity stars:<30",
     ]
 
 def cmd_scan(args):
