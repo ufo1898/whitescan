@@ -38,7 +38,7 @@ def _opener():
 
 from datetime import datetime, timezone
 
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 VERSION_URL = "https://raw.githubusercontent.com/ufo1898/whitescan/main/VERSION"
 SELF_URL = "https://raw.githubusercontent.com/ufo1898/whitescan/main/whitescan.py"
 REPORT_DIR = os.path.expanduser("~/whitescan/reports")
@@ -66,10 +66,26 @@ def detect_oracle_spot_price(code):
     return None
 
 def detect_reentrancy(code):
-    has_call = re.search(r'\.call\{value:|\.call\(|\.send\(|\.delegatecall\(', code)
+    has_call = re.search(r'\.call\{value:|\.call\(|\.delegatecall\(', code)
     has_guard = re.search(r'nonReentrant|ReentrancyGuard|_notEntered|_status\s*=', code)
-    if has_call and not has_guard:
-        return "存在低级外部调用且无重入保护"
+    if not has_call or has_guard:
+        return None
+    # CEI违例判定: 外部调用之后仍有状态写(余额清零/记账) = 经典重入可利用点
+    # call前写完再call(检查-生效-交互)是安全模式, 不报
+    write_pat = re.compile(
+        r'^\s*(?!(?:uint\d*|int\d*|bool|address\s*(?:payable)?\s+\w+\s*=|bytes\d*|string|mapping|IERC\d*|enum|struct|function|require|emit|return|if|for|while|delete)\b)'
+        r'(\w+)\s*(?:\[[^\]]*\])?\s*(?:\+=|-=|\*=|/=|\^=|=)(?!=)\s*[^;]+;', re.M)
+    for m in re.finditer(r'\.call\{value:|\.call\(|\.delegatecall\(', code):
+        fend = code.find('function', m.end())
+        after = code[m.end():fend if fend > 0 else len(code)]
+        # 截到函数体结束(第一个^}行)
+        brace_end = after.find('\n}')
+        if brace_end > 0:
+            after = after[:brace_end]
+        writes = [w for w in write_pat.findall(after)
+                  if w not in ('success', 'ok', 'data', 'result')]
+        if writes:
+            return "外部调用后仍有状态写入且无重入保护(CEI违例, 经典重入)"
     return None
 
 def detect_tx_origin(code):
@@ -174,15 +190,21 @@ def detect_block_timestamp(code):
     return None if pure_staleness else "block.timestamp 参与关键逻辑，矿工可小幅操纵"
 
 def detect_unchecked_transfer(code):
-    if not re.search(r'\.transfer\(|\.send\(', code):
+    # 只关心ERC20的transfer/send: payable(x).transfer/send是原生币转账(失败自动revert, 无返回值问题)
+    erc20_calls = [m for m in re.finditer(r'\.transfer\(|\.send\(', code)
+                   if not re.search(r'payable\s*\([^)]*\)\s*\.(?:transfer|send)\s*\(', code[max(0,m.start()-60):m.end()+20])]
+    if not erc20_calls:
         return None
-    # 守卫按语句分界(;)识别, 兼容: require(x.send(..)) / bool ok = x.send(..); require(ok) / if(!x.send(..))
-    guard = re.search(
-        r'require\([^;]*?\.(?:transfer|send)\s*\('
-        r'|\b(?:ok|success)\s*=\s*[^;]*?\.(?:transfer|send)\s*\('
-        r'|if\s*\([^;]*?\.(?:transfer|send)\s*\)', code)
-    if not guard:
-        return ".transfer/.send 返回值未检查"
+    # 逐调用点检查同语句(至下个;)是否有守卫: require(...)/bool v = .../if(!v).../v = ...
+    guard = re.compile(
+        r'(?:require\s*\([^;]*?|\b\w+\s*=\s*(?:bool\s+)?[^;]*?)\.(?:transfer|send)\s*\('
+        r'|if\s*\([^;]*?\.(?:transfer|send)\s*\(')
+    for m in erc20_calls:
+        stmt_start = code.rfind(';', 0, m.start()) + 1
+        stmt_end = code.find(';', m.end())
+        stmt = code[stmt_start:stmt_end if stmt_end > 0 else len(code)]
+        if not guard.search(stmt):
+            return ".transfer/.send 返回值未检查"
     return None
 
 def detect_unprotected_initializer(code):
@@ -413,6 +435,10 @@ def search_queries():
         "yield farming staking solidity language:Solidity stars:<30",
         "presale token sale solidity language:Solidity stars:<30",
         "bridge locker solidity language:Solidity stars:<30",
+        "price oracle solidity language:Solidity stars:<30",
+        "governance timelock solidity language:Solidity stars:<30",
+        "token vesting solidity language:Solidity stars:<30",
+        "multisig wallet solidity language:Solidity stars:<30",
     ]
 
 def cmd_scan(args):
@@ -963,17 +989,21 @@ contract OracleLib {
 """
 SAMPLE_UTRANSFER_V = """
 pragma solidity ^0.8.19;
+interface IERC20 { function transfer(address to, uint256 amount) external returns (bool); }
 contract Distributor {
+    IERC20 public token;
     function payout(address to, uint amt) external nonReentrant {
-        payable(to).transfer(amt);
+        token.transfer(to, amt);  // 返回值丢弃, 失败静默
     }
 }
 """
 SAMPLE_UTRANSFER_S = """
 pragma solidity ^0.8.19;
+interface IERC20 { function transfer(address to, uint256 amount) external returns (bool); }
 contract DistributorSafe {
+    IERC20 public token;
     function payout(address to, uint amt) external nonReentrant {
-        require(payable(to).send(amt), "payout failed");
+        require(token.transfer(to, amt), "payout failed");  // 返回值已检查
     }
 }
 """

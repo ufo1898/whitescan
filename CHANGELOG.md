@@ -1,3 +1,12 @@
+## [1.3.2] - 2026-08-28
+
+### Fixed
+- `UNCHECKED-TRANSFER` 精度修复：不再误报原生币 `payable(x).transfer()`（失败自动 revert，无需检查返回值），只检测 ERC20 转账返回值丢弃；样例同步更新为真 ERC20 形态
+- `REENTRANCY` 精度修复（CEI 语义）：只报「外部调用之后仍有状态写入」的经典重入模式；纯提款与 call 前完成状态写（CEI 安全模式）不再误报
+
+### Changed
+- 搜索 query 12 → 16：新增 price oracle / governance timelock / token vesting / multisig wallet 赛道（依据 2026 年 6-8 月盗币事件复盘攻击面扩展）
+
 # Changelog
 
 本文件记录 WhiteScan 的版本变更。格式参考 Keep a Changelog。
