@@ -107,22 +107,25 @@ launchctl load ~/Library/LaunchAgents/com.whitescan.scan.plist
 
 MIT
 
-## 🔴 链上新合约实时监控 (v1.4.0+)
+## 🔴 链上新合约实时监控 (v1.5.0 三链并行)
 
-新部署合约 1 个区块内自动扫描 + 告警：
+新部署合约 1 个区块内自动扫描 + 告警 + HIGH 自动生成 PoC/影响评估报告：
 
 ```bash
-# 常驻监控主网(推荐 systemd)
+# 常驻监控全部链: 主网 + Sepolia + BSC 三线程并行(推荐 systemd)
 python3 whitescan_monitor.py
 
-# 单轮/测试网/手动深扫/自检
-python3 whitescan_monitor.py --once
-python3 whitescan_monitor.py --chain sepolia
+# 指定链(逗号多选) / 单轮 / 手动深扫 / 自检
+python3 whitescan_monitor.py --chain mainnet,bsc
+python3 whitescan_monitor.py --chain bsc --once
 python3 whitescan_monitor.py --addr 0x...
 python3 whitescan_monitor.py selftest
 ```
 
 - 数据源: publicnode/1rpc/drpc RPC 故障转移 + Blockscout 已验证源码(均免费无 key)
-- 覆盖普通创建 + CREATE2 工厂部署(eth_getBlockReceipts)
-- 告警: HIGH/MED 命中写 monitor_hits_*.json + 可选 WHITESCAN_ALERT_WEBHOOK webhook
-- 每块上限 30 合约、源码 200KB 上限、轮询异常自动重试，永不因单合约故障中断
+- 主网/Sepolia: eth_getBlockReceipts 模式(覆盖普通创建 + CREATE2 工厂部署)
+- **BSC: 事件驱动模式** — 轮询 PancakeSwap V2 工厂 PairCreated getLogs(BSC 0.75s 出块逐块回执成本过高; BSC 无免费验证源码 API 已实测, 字节码指纹正是刚需)
+- **字节码指纹层 BYTECODE-FH-TOKEN-SIG**: 未验证源码合约不再跳过, 匹配 FH Token 家族特征(代币外呼 pair.sync + gas 全转发, 双特征同中才报, 正负对照全验证)
+- **HIGH 命中 → 自动 PoC/影响评估报告**: 12 条 HIGH 规则模板(攻击路径/影响/可利用性/Foundry PoC 骨架), 落盘 reports/{chain}/, 告警附报告路径
+- 告警: HIGH/MED 命中写 monitor_hits_{chain}.json + 可选 WHITESCAN_ALERT_WEBHOOK(内置 SSRF 防护)
+- 韧性: RPC 指数退避+随机抖动(防公共 RPC 封禁) / 每块上限 30 合约 / 源码 200KB 上限 / monitor_health.json 健康上报, 永不因单合约故障中断
