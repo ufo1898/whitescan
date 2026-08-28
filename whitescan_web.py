@@ -11,6 +11,7 @@ WhiteScan Web v1.2.0 — 网页版漏洞扫描器
   POST /api/scan             body: {"target": "owner/repo 或 URL 或 Solidity源码", "ai": bool}
   GET  /api/status           健康+版本（无鉴权，供监控）
   GET  /api/results          最近批量扫描结果
+  GET  /api/monitor          链上新合约监控告警（读 monitor_state_*.json / monitor_hits_*.json）
 
 安全:
   - 只监听 127.0.0.1（公网走 nginx 反代 + 随机路径）
@@ -25,6 +26,7 @@ import os
 import re
 import sys
 import threading
+import time
 import urllib.request
 import urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -137,6 +139,11 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(json.load(f))
             except Exception:
                 self._json({"results": [], "ts": None})
+        elif path == "/api/monitor":
+            if not _check_token(self):
+                self._json({"error": "需要 token"}, 401)
+                return
+            self._json(monitor_snapshot())
         else:
             self._json({"error": "not found"}, 404)
 
@@ -279,6 +286,11 @@ label.chk{color:var(--dim);font-size:13px;display:flex;gap:5px;align-items:cente
   </div>
 
   <div id="results"></div>
+
+  <div class="card" id="monCard" style="display:none">
+    <h2 style="margin:0 0 8px">📡 链上新合约实时监控</h2>
+    <div id="monBody" style="font-size:13px">加载中…</div>
+  </div>
 </div>
 <script>
 function tok(){const t=document.getElementById('token').value.trim();return t}
@@ -333,15 +345,71 @@ function render(d){
   html+='</div>';
   el.innerHTML=html;
 }
+function renderMon(d){
+  const el=document.getElementById('monBody');
+  if(!d.chains||!d.chains.length){el.innerHTML='<span style="color:var(--dim)">监控未运行（whitescan-monitor 服务未启动或尚无数据）</span>';return}
+  let html='';
+  for(const c of d.chains){
+    const st=c.state||{};
+    const last=st.last_height?('#'+st.last_height):'?';
+    const ago=st.ts?Math.floor((Date.now()/1000-st.ts)/60):'?';
+    const hits=c.hits||[];
+    html+=`<div style="margin-bottom:10px">
+      <div><b>${esc(c.chain)}</b> · 扫至块${esc(last)} · 状态更新于 ${ago} 分钟前 · 告警 <b style="color:${hits.length?'var(--red)':'var(--grn)'}">${hits.length}</b></div>`;
+    for(const h of hits.slice().reverse()){
+      const sevCls=h.hits&&h.hits.some(x=>x.sev==='HIGH')?'HIGH':(h.hits&&h.hits.some(x=>x.sev==='MED')?'MED':'LOW');
+      html+=`<div class="hit ${sevCls}" style="margin-top:6px">
+        <div class="head"><span class="rid">${esc(h.contract_name||'')}</span><span class="sev ${sevCls}">${sevCls}</span></div>
+        <div style="font-size:12px">${esc(h.address)} @ 块${h.block} · ${new Date(h.ts*1000).toLocaleString()}</div>
+        ${(h.hits||[]).map(x=>`<div>[${x.sev}] ${esc(x.id)}: ${esc((x.desc||'').slice(0,70))}</div>`).join('')}
+        <div class="why"><a href="${esc(h.explorer_ui)}/address/${esc(h.address)}" target="_blank" style="color:var(--blue)">查看合约 ↗</a> · 创建tx ${esc((h.tx||'').slice(0,18))}…</div>
+      </div>`;
+    }
+    html+='</div>';
+  }
+  el.innerHTML=html;
+}
 fetch('/api/status').then(r=>r.json()).then(d=>{
   document.getElementById('ver').textContent='v'+d.version;
   document.getElementById('rulecount').textContent=d.rules+' 条规则 + AI 语义复核'+(d.auth?' · 🔒token模式':'');
   if(d.auth){document.getElementById('tokenRow').style.display='flex';
     const saved=localStorage.getItem('ws_tok');if(saved)document.getElementById('token').value=saved;}
+  document.getElementById('monCard').style.display='block';
+  const loadMon=()=>fetch('/api/monitor').then(r=>r.json()).then(renderMon).catch(()=>{});
+  loadMon(); setInterval(loadMon, 30000);
 });
 </script>
 </body>
 </html>"""
+
+
+def monitor_snapshot():
+    """聚合各链监控状态与告警（monitor 进程落盘，web 只读）"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    chains = []
+    try:
+        for f in sorted(os.listdir(here)):
+            m = re.match(r"monitor_state_(\w+)\.json$", f)
+            if not m:
+                continue
+            ck = m.group(1)
+            state = {}
+            try:
+                with open(os.path.join(here, f)) as fh:
+                    state = json.load(fh)
+            except Exception:
+                pass
+            hits = []
+            hp = os.path.join(here, f"monitor_hits_{ck}.json")
+            try:
+                with open(hp) as fh:
+                    hits = json.load(fh)[-30:]  # 最近的
+            except Exception:
+                pass
+            chains.append({"chain": ck, "state": state, "hits": hits})
+    except Exception:
+        pass
+    return {"ok": True, "chains": chains, "ts": int(time.time())}
 
 
 def main():
