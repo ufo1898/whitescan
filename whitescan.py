@@ -38,7 +38,7 @@ def _opener():
 
 from datetime import datetime, timezone
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 VERSION_URL = "https://raw.githubusercontent.com/ufo1898/whitescan/main/VERSION"
 SELF_URL = "https://raw.githubusercontent.com/ufo1898/whitescan/main/whitescan.py"
 REPORT_DIR = os.path.expanduser("~/whitescan/reports")
@@ -277,6 +277,22 @@ def detect_missing_swap_deadline(code):
 
 
 # (规则id, 中文名, 严重级, 检测函数)
+
+def detect_tax_burn_from_pool(code):
+    """通缩税代币在 _transfer 卖出路径烧池子余额 + 主动 sync 池子 (FH Token 2026-08-26 $20K 模式)。
+    三特征同时命中才报: ①DEAD/零地址烧币 ②引用 AMM pair 变量 ③合约内调 sync()"""
+    if len(code) > 400000:
+        return None
+    has_dead = bool(re.search(r"0x[0-9a-fA-F]{38,40}[dD][eE][aA][dD]|\bdead\b|DEAD", code))
+    has_pair = bool(re.search(r"pair|Pair\s*\(|_pair|IPancakePair|IUniswapV2Pair", code))
+    has_sync = bool(re.search(r"\.sync\s*\(\s*\)", code))
+    # 烧币来源必须是 pair/池子而不是 sender: pair.balance 或 balanceOf(pair) 或 transfer(dead) 前取 pair 余额
+    burn_pair = bool(re.search(r"(_burn\s*\(\s*pair|_transfer\s*\(\s*pair|balanceOf\s*\(\s*(pair|address\s*\(\s*this\s*\))|balances\s*\[\s*(pair|address\s*\(\s*pair\s*\))|pair\s*\.\s*balance)", code, re.I))
+    if has_dead and has_pair and has_sync and burn_pair:
+        return ("通缩税代币在转账路径烧 AMM pair 余额并立即 sync(): 卖出税从池子扣而非卖方扣, "
+                "每次卖出烧掉流动性后备; 买卖循环可单笔内重复抽干 (FH Token 2026-08-26 $20K 实战)")
+    return None
+
 VULN_RULES = [
     ("COMPOUND-V2-FIRST-DEPOSITOR", "第一笔存款攻击(抽干后入者)", "HIGH",   detect_first_depositor),
     ("ORACLE-SPOT-PRICE",           "预言机spot价格操纵",       "HIGH",   detect_oracle_spot_price),
@@ -302,6 +318,7 @@ VULN_RULES = [
     ("CROSSCHAIN-SIG-REPLAY",       "跨链消息签名重放",         "HIGH",   detect_crosschain_sig_replay),
     ("HARDCODED-AUTH-SECRET",       "硬编码鉴权串",             "MED",    detect_hardcoded_auth_secret),
     ("LEGACY-LIVE-CONTRACT",        "弃用合约仍可调用",         "LOW",    detect_legacy_live_contract),
+    ("TAX-BURN-FROM-POOL",          "通缩税烧池子+主动sync",    "HIGH",   detect_tax_burn_from_pool),
 ]
 
 HIGH_RULE_IDS = {r[0] for r in VULN_RULES if r[2] == "HIGH"}
@@ -1269,6 +1286,33 @@ contract TransitRouterLegacySafe {
 }
 """
 
+# ---- TAX-BURN-FROM-POOL (FH Token 2026-08-26 $20K 模式) ----
+SAMPLE_TAXBURN_V = """
+pragma solidity ^0.8.19;
+contract FHToken {
+    IPancakePair public pair;
+    address public dead = 0x000000000000000000000000000000000000dEaD;
+    function _transfer(address sender, address recipient, uint256 amount) internal {
+        if (isSell(sender)) {
+            uint256 burnAmt = IPancakePair(pair).balanceOf(address(this)) * 15 / 100;
+            IPancakePair(pair).sync();
+        }
+        super._transfer(sender, recipient, amount);
+    }
+}
+"""
+SAMPLE_TAXBURN_S = """
+pragma solidity ^0.8.19;
+contract SafeTaxToken {
+    address public dead = 0x000000000000000000000000000000000000dEaD;
+    function _transfer(address sender, address recipient, uint256 amount) internal {
+        uint256 tax = amount * 3 / 100;
+        super._transfer(sender, dead, tax);
+        super._transfer(sender, recipient, amount - tax);
+    }
+}
+"""
+
 RULE_TESTS = [
     ("COMPOUND-V2-FIRST-DEPOSITOR", SAMPLE_VULN,            SAMPLE_FIXED),
     ("ORACLE-SPOT-PRICE",           SAMPLE_ORACLE_V,        SAMPLE_ORACLE_S),
@@ -1294,6 +1338,7 @@ RULE_TESTS = [
     ("CROSSCHAIN-SIG-REPLAY",       SAMPLE_XCHAIN_V,        SAMPLE_XCHAIN_S),
     ("HARDCODED-AUTH-SECRET",       SAMPLE_SECRET_V,        SAMPLE_SECRET_S),
     ("LEGACY-LIVE-CONTRACT",        SAMPLE_LEGACY_V,        SAMPLE_LEGACY_S),
+    ("TAX-BURN-FROM-POOL",          SAMPLE_TAXBURN_V,       SAMPLE_TAXBURN_S),
 ]
 
 def self_test():
