@@ -1,3 +1,8 @@
+## [1.4.1] - 2026-08-28
+
+### Added
+- 新规则 TAX-BURN-FROM-POOL (HIGH, 25条规则): 通缩税代币在 _transfer 卖出路径烧 AMM pair 余额 + 主动调 sync() —— FH Token (BSC, 2026-08-26) $20K PancakeSwap V2 抽干案实战提炼。攻击机制: 卖出税从池子扣而非卖方扣 + 合约内部代 pair 触发 sync 过早启用套利窗口, 买卖循环单笔内 50 轮抽干 $19,999 USDT。规则三特征(烧dead来源为池子/引用pair/调sync)同时命中才报, 安全样例(正常税收烧卖家自己)零误报
+
 ## [1.4.0] - 2026-08-28
 
 ### 新增: 链上新合约实时监控器 (whitescan_monitor.py)
