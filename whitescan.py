@@ -38,7 +38,7 @@ def _opener():
 
 from datetime import datetime, timezone
 
-__version__ = "1.3.2"
+__version__ = "1.4.0"
 VERSION_URL = "https://raw.githubusercontent.com/ufo1898/whitescan/main/VERSION"
 SELF_URL = "https://raw.githubusercontent.com/ufo1898/whitescan/main/whitescan.py"
 REPORT_DIR = os.path.expanduser("~/whitescan/reports")
