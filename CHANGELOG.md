@@ -1,3 +1,19 @@
+## [1.5.0] - 2026-08-28
+
+### Added
+- **多链并行**: 每链独立线程 + state/hits/统计隔离, `--chain mainnet,bsc` 逗号多选; 主网(receipts 模式) + Sepolia + **BSC(事件驱动模式)** 三链常驻
+- **BSC 事件驱动**: BSC 0.75s 出块 + 无免费验证源码 API(bnb.blockscout/routescan/sourcify 全 404 实测), 逐块回执成本过高 → 轮询 PancakeSwap V2 工厂 PairCreated getLogs(单批 3000 块≈37分钟) → 新币直接进扫描队列; WBNB/USDT/BUSD/CAKE/USDC/ETH 六大基础币白名单排除
+- **BYTECODE-FH-TOKEN-SIG (HIGH)**: 字节码指纹层。未验证源码合约不再跳过: eth_getCode → 匹配「代币外呼 pair.sync() 0xfff6cae9 + gas 全转发 ABI 编码」双特征同中才报。正对照 FH(主网 16.7KB)/YNP(BSC 23.5KB) 双命中; 负对照 USDT/UNI/正规 UniswapV2Pair(自带 sync 但无外呼模式)/正常 ERC20 全零。BSC 实测 25 分钟新池 28 个中 19 新币 18 个未验证 → 指纹层正是该场景刚需
+- **HIGH 命中 → 自动 PoC/影响评估报告**: 12 条 HIGH 规则全覆盖模板(攻击路径/影响/可利用性/Foundry PoC 骨架/建议), 落盘 reports/{chain}/{ts}_{addr}.md, 告警消息附报告路径; 首份实战报告已生成: YNP(BSC 毒币, 字节码指纹命中)
+- **RPC 指数退避+30%随机抖动**(借鉴 1ai-nexus): 连续失败不死磕公共 RPC, 2^n 封顶 120s, 主循环异常自动进入退避
+- **Webhook SSRF 防护**(借鉴 1ai-nexus): 推送前校验目标 URL, 拒绝 http/https 以外协议 + 127/10/172.16-31/192.168/169.254/0./::1/IPv6 内网段/localhost
+- **健康上报 monitor_health.json**(借鉴 1ai-nexus): 每链实时块高/当前 RPC/失败连击/扫描统计, 看板/巡检可直接消费
+
+### Changed
+- 监控器重构: 全局 CHAIN_KEY 移除 → 每 run_chain 线程持有独立 ctx(rpc_idx/fail_streak/stats/seen)
+- 告警文本新增扫描模式标签(源码/字节码指纹), 字节码命中显示 Unverified
+- selftest 5 组 → 11 组: 新增字节码指纹正负对照/PoC 报告生成/SSRF/退避抖动/PairCreated 解析/BSC 白名单/告警格式(含指纹+报告路径)
+
 ## [1.4.1] - 2026-08-28
 
 ### Added
