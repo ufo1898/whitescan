@@ -1,3 +1,14 @@
+## [1.4.0] - 2026-08-28
+
+### 新增: 链上新合约实时监控器 (whitescan_monitor.py)
+- 轮询公共 RPC (publicnode/1rpc/drpc 故障转移) 抓新部署合约(eth_getBlockReceipts, 覆盖 CREATE2 工厂)
+- Blockscout 免费拉已验证源码 -> 复用 24 条规则引擎 -> HIGH/MED 实时告警
+- 多链支持(主网/Sepolia), state/hits 按链分文件防块高互串
+- --once 单轮 / --addr 手动深扫 / selftest 离线自检 / WHITESCAN_ALERT_WEBHOOK 告警推送
+- Web 看板新增「链上实时监控」板块 + /api/monitor 端点(30s 自动刷新)
+- systemd 服务 whitescan-monitor 常驻(Restart=always, MemoryMax=150M)
+- 首战验证: 主网新部署 FashUSDTLiquidityBot 等蜜罐特征合约 1 块内捕获(重入/tx.origin/弱随机)
+
 ## [1.3.2] - 2026-08-28
 
 ### Fixed
