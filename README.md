@@ -106,3 +106,23 @@ launchctl load ~/Library/LaunchAgents/com.whitescan.scan.plist
 ## License
 
 MIT
+
+## 🔴 链上新合约实时监控 (v1.4.0+)
+
+新部署合约 1 个区块内自动扫描 + 告警：
+
+```bash
+# 常驻监控主网(推荐 systemd)
+python3 whitescan_monitor.py
+
+# 单轮/测试网/手动深扫/自检
+python3 whitescan_monitor.py --once
+python3 whitescan_monitor.py --chain sepolia
+python3 whitescan_monitor.py --addr 0x...
+python3 whitescan_monitor.py selftest
+```
+
+- 数据源: publicnode/1rpc/drpc RPC 故障转移 + Blockscout 已验证源码(均免费无 key)
+- 覆盖普通创建 + CREATE2 工厂部署(eth_getBlockReceipts)
+- 告警: HIGH/MED 命中写 monitor_hits_*.json + 可选 WHITESCAN_ALERT_WEBHOOK webhook
+- 每块上限 30 合约、源码 200KB 上限、轮询异常自动重试，永不因单合约故障中断
