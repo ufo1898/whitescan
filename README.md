@@ -68,7 +68,7 @@ python3 whitescan.py update
 | `TIMELOCK-ZERO` | HIGH | 治理timelock可清零 |
 | `CROSSCHAIN-SIG-REPLAY` | HIGH | 跨链消息签名重放 |
 | `HARDCODED-AUTH-SECRET` | MED | 硬编码鉴权串 |
-| `LEGACY-LIVE-CONTRACT` | LOW | 弃用合约仍可调用 |
+| `LEGACY-LIVE-CONTRACT` | LOW | 弃用合约仍可调用 | | | `TAX-BURN-FROM-POOL` | HIGH | 通缩税烧池子+主动sync（FH Token 2026-08-26 $20K 实战提炼） |
 
 ## 配置（环境变量 / 凭证文件）
 
