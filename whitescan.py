@@ -38,7 +38,7 @@ def _opener():
 
 from datetime import datetime, timezone
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 VERSION_URL = "https://raw.githubusercontent.com/ufo1898/whitescan/main/VERSION"
 SELF_URL = "https://raw.githubusercontent.com/ufo1898/whitescan/main/whitescan.py"
 REPORT_DIR = os.path.expanduser("~/whitescan/reports")
@@ -105,6 +105,53 @@ def detect_integer_overflow(code):
     if re.search(r'pragma\s+solidity\s+[\^~]?0\.[0-7]', code) and not re.search(
             r'SafeMath|safemath|unchecked\s*\{', code):
         return "pragma <0.8 且无 SafeMath，算术运算可溢出"
+    return None
+
+def detect_timelock_zero(code):
+    """Timelock清零(2026-08 Term Finance $8.5M): 治理可把delay设为0, 提案即时执行无缓冲"""
+    if not re.search(r'timelock|Timelock|delay|DELAY|gracePeriod|minDelay', code):
+        return None
+    # 危险特征: delay/duration 作为状态变量可被 setter 改, 且无下限约束
+    if re.search(r'function\s+set\w*(Delay|Timelock|Duration)\s*\(', code):
+        # setter 内无 >= 下限检查(如 require(newDelay >= 1 days))
+        m = re.search(r'function\s+set\w*(Delay|Timelock|Duration)\s*\([^)]*\)\s*[^{]*\{([\s\S]*?)\}', code)
+        if m and not re.search(r'>=\s*\d|MIN(?:imum)?_?DELAY|MINIMUM_DELAY|minDelay', m.group(2)):
+            return "timelock delay 可经 setter 设为 0，恶意提案可即时执行(Term Finance模式)"
+    if re.search(r'(delay|Duration|Timelock)\s*=\s*0\b', code) and not re.search(r'MIN|require', code):
+        return "timelock delay 初始化为 0"
+    return None
+
+def detect_crosschain_sig_replay(code):
+    """跨链消息签名重放(2026-06 桥$127M): 验签缺 chainId/srcChain/nonce, 一链签名他链重放"""
+    if not re.search(r'ecrecover\s*\(|validateProof|verifySignature|checkSignatures', code):
+        return None
+    ctx_hint = re.search(r'(srcChain|sourceChain|destChain|dstChain|crossChain|bridge|remoteChain|fromChain)', code, re.I)
+    if not ctx_hint:
+        return None  # 非跨链场景, 交给 SIGNATURE-REPLAY
+    has_chainid = re.search(r'block\.chainid|chainId|srcChainId|sourceChainId|CHAIN_ID', code)
+    has_nonce = re.search(r'nonce|sequence|usedHash|consumed', code, re.I)
+    missing = [n for n, ok in (("chainId", has_chainid), ("nonce", has_nonce)) if not ok]
+    if missing:
+        return f"跨链消息验签缺 {'/'.join(missing)}，签名可跨链/跨序重放(2026-06桥失窃$127M模式)"
+    return None
+
+def detect_hardcoded_auth_secret(code):
+    """硬编码认证串(2026-05 SquidRouterModule $3.2M): 固定字符串当消息鉴权, 泄露即资产可取"""
+    # 形态1: keccak256(abi.encodePacked("literal...")) 参与比较/鉴权
+    if re.search(r'keccak256\s*\(\s*abi\.encodePacked\s*\(\s*"[^"]{8,}"\s*\)\s*\)', code):
+        return "硬编码字符串哈希用于鉴权，泄露即伪造(SquidRouterModule $3.2M模式)"
+    # 形态2: require(keccak256(bytes("literal")) == ...)
+    if re.search(r'keccak256\s*\(\s*bytes\s*\(\s*"[^"]{8,}"\s*\)\s*\)', code):
+        return "硬编码字符串哈希用于鉴权，泄露即伪造(SquidRouterModule $3.2M模式)"
+    return None
+
+def detect_legacy_live_contract(code):
+    """遗留合约仍在服务(2026-05 Transit Finance $1.88M): deprecated/legacy 合约未弃用, 弱校验可调用"""
+    if re.search(r'deprecated|legacy|old contract|use \w+ instead|@notice\s*.*(deprecated|do not use)', code, re.I):
+        # 弃用合约里还有外部可调入口
+        if re.search(r'function\s+\w+\s*\([^)]*\)\s*(?:external|public)', code) and \
+           not re.search(r'revert\s*\(\s*["\']?deprecated|selfdestruct|onlyOwner|pause', code, re.I):
+            return "合约标记 deprecated/legacy 但入口仍可调用且无熔断(Transit Finance $1.88M模式)"
     return None
 
 def detect_zero_check(code):
@@ -229,6 +276,10 @@ VULN_RULES = [
     ("WEAK-RANDOMNESS",             "弱随机数",                 "MED",    detect_weak_randomness),
     ("UNBOUNDED-LOOP-DOS",          "无上限循环DoS",            "MED",    detect_unbounded_loop_dos),
     ("MISSING-SWAP-DEADLINE",       "swap无deadline",           "LOW",    detect_missing_swap_deadline),
+    ("TIMELOCK-ZERO",               "治理timelock可清零",       "HIGH",   detect_timelock_zero),
+    ("CROSSCHAIN-SIG-REPLAY",       "跨链消息签名重放",         "HIGH",   detect_crosschain_sig_replay),
+    ("HARDCODED-AUTH-SECRET",       "硬编码鉴权串",             "MED",    detect_hardcoded_auth_secret),
+    ("LEGACY-LIVE-CONTRACT",        "弃用合约仍可调用",         "LOW",    detect_legacy_live_contract),
 ]
 
 HIGH_RULE_IDS = {r[0] for r in VULN_RULES if r[2] == "HIGH"}
@@ -1079,6 +1130,105 @@ contract ClaimSafe {
 """
 
 # 全规则测试矩阵: (规则id, 漏洞样例, 安全样例) — 覆盖率不足 selftest 直接失败
+# ---- TIMELOCK-ZERO (Term Finance 2026-08 模式) ----
+SAMPLE_TIMELOCK_V = """
+pragma solidity ^0.8.19;
+contract Gov {
+    uint public delay = 7 days;
+    address admin;
+    modifier onlyAdmin { require(msg.sender == admin); _; }
+    function setDelay(uint newDelay) external onlyAdmin {
+        delay = newDelay;
+    }
+    function execute() external view returns (bool) { return block.timestamp > delay; }
+}
+"""
+SAMPLE_TIMELOCK_S = """
+pragma solidity ^0.8.19;
+contract GovSafe {
+    uint public delay = 7 days;
+    uint public constant MIN_DELAY = 1 days;
+    address admin;
+    modifier onlyAdmin { require(msg.sender == admin); _; }
+    function setDelay(uint newDelay) external onlyAdmin {
+        require(newDelay >= MIN_DELAY, "too short");
+        delay = newDelay;
+    }
+}
+"""
+
+# ---- CROSSCHAIN-SIG-REPLAY (2026-06 桥 $127M 模式: 缺chainId/nonce) ----
+SAMPLE_XCHAIN_V = """
+pragma solidity ^0.8.19;
+contract BridgeInbox {
+    address validator;
+    function validateProof(bytes32 msgHash, bytes calldata sig, address dest) external view returns (bool) {
+        return ecrerecover(keccak256(abi.encodePacked(msgHash, dest)), sig) == validator;
+    }
+}
+"""
+SAMPLE_XCHAIN_S = """
+pragma solidity ^0.8.19;
+contract BridgeInboxSafe {
+    address validator;
+    mapping(bytes32 => bool) usedHash;
+    function validateProof(bytes32 msgHash, bytes calldata sig, uint256 srcChainId, uint256 seq) external returns (bool) {
+        require(block.chainid == srcChainId);
+        require(!usedHash[msgHash]);
+        usedHash[msgHash] = true;
+        return ecrerecover(keccak256(abi.encodePacked(msgHash, srcChainId, seq)), sig) == validator;
+    }
+}
+"""
+
+# ---- HARDCODED-AUTH-SECRET (SquidRouterModule 2026-05 $3.2M 模式) ----
+SAMPLE_SECRET_V = """
+pragma solidity ^0.8.19;
+contract RouterModule {
+    function authenticate(bytes memory proof) external pure returns (bool) {
+        return keccak256(abi.encodePacked("super-secret-auth-string-2026")) == keccak256(proof);
+    }
+    function callTarget(bytes32 payload, string memory token) external {
+        require(keccak256(abi.encodePacked(token)) == keccak256(abi.encodePacked("module-auth-token-v1")));
+        payload;
+    }
+}
+"""
+SAMPLE_SECRET_S = """
+pragma solidity ^0.8.19;
+contract RouterModuleSafe {
+    address operator;
+    function authenticate(bytes32 payload, bytes calldata sig) external view returns (bool) {
+        return ecrerecover(keccak256(abi.encodePacked(payload)), sig) == operator;
+    }
+}
+"""
+
+# ---- LEGACY-LIVE-CONTRACT (Transit Finance 2026-05 $1.88M 模式) ----
+SAMPLE_LEGACY_V = """
+pragma solidity ^0.8.19;
+/// @notice DEPRECATED - use TransitV2 instead
+contract TransitRouterLegacy {
+    mapping(address => uint) balances;
+    function withdraw(uint amount) external {
+        require(balances[msg.sender] >= amount);
+        balances[msg.sender] -= amount;
+        payable(msg.sender).transfer(amount);
+    }
+}
+"""
+SAMPLE_LEGACY_S = """
+pragma solidity ^0.8.19;
+/// @notice DEPRECATED - use TransitV2 instead
+contract TransitRouterLegacySafe {
+    bool private stopped;
+    function withdraw(uint amount) external {
+        require(!stopped, "paused");
+        amount;
+    }
+}
+"""
+
 RULE_TESTS = [
     ("COMPOUND-V2-FIRST-DEPOSITOR", SAMPLE_VULN,            SAMPLE_FIXED),
     ("ORACLE-SPOT-PRICE",           SAMPLE_ORACLE_V,        SAMPLE_ORACLE_S),
@@ -1100,6 +1250,10 @@ RULE_TESTS = [
     ("WEAK-RANDOMNESS",             SAMPLE_RAND_V,          SAMPLE_RAND_S),
     ("UNBOUNDED-LOOP-DOS",          SAMPLE_LOOP_V,          SAMPLE_LOOP_S),
     ("MISSING-SWAP-DEADLINE",       SAMPLE_SWAPDL_V,        SAMPLE_SWAPDL_S),
+    ("TIMELOCK-ZERO",               SAMPLE_TIMELOCK_V,      SAMPLE_TIMELOCK_S),
+    ("CROSSCHAIN-SIG-REPLAY",       SAMPLE_XCHAIN_V,        SAMPLE_XCHAIN_S),
+    ("HARDCODED-AUTH-SECRET",       SAMPLE_SECRET_V,        SAMPLE_SECRET_S),
+    ("LEGACY-LIVE-CONTRACT",        SAMPLE_LEGACY_V,        SAMPLE_LEGACY_S),
 ]
 
 def self_test():

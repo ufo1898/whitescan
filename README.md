@@ -65,6 +65,10 @@ python3 whitescan.py update
 | `WEAK-RANDOMNESS` | MED | 弱随机数 |
 | `UNBOUNDED-LOOP-DOS` | MED | 无上限循环DoS |
 | `MISSING-SWAP-DEADLINE` | LOW | swap无deadline |
+| `TIMELOCK-ZERO` | HIGH | 治理timelock可清零 |
+| `CROSSCHAIN-SIG-REPLAY` | HIGH | 跨链消息签名重放 |
+| `HARDCODED-AUTH-SECRET` | MED | 硬编码鉴权串 |
+| `LEGACY-LIVE-CONTRACT` | LOW | 弃用合约仍可调用 |
 
 ## 配置（环境变量 / 凭证文件）
 

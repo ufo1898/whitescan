@@ -2,6 +2,21 @@
 
 本文件记录 WhiteScan 的版本变更。格式参考 Keep a Changelog。
 
+## [1.3.0] - 2026-08-28
+
+### Added
+- 基于近期实战盗币事件复盘新增 4 条规则（20 → 24）：
+  - `TIMELOCK-ZERO`（HIGH）：治理 timelock delay 可经 setter 清零 —— 复盘 Term Finance 2026-08-24 $8.5M 治理攻击
+  - `CROSSCHAIN-SIG-REPLAY`（HIGH）：跨链消息验签缺 chainId/nonce —— 复盘 2026-06-14 三协议桥 $127M 签名重放
+  - `HARDCODED-AUTH-SECRET`（MED）：硬编码字符串鉴权 —— 复盘 SquidRouterModule 2026-05 $3.2M
+  - `LEGACY-LIVE-CONTRACT`（LOW）：弃用合约入口仍可调用 —— 复盘 Transit Finance 2026-05 $1.88M
+- selftest 矩阵同步扩至 24/24（漏洞必中 + 安全零误报）
+
+### 事件背景（2026 H1 数据）
+- H1 2026 共 212 起安全事件，损失 $1.1B（Blockaid），为史上最惨半年
+- 凭据/私钥类攻击占事件数 15% 却占损失金额 76%；合约代码漏洞仍是事件数主力（125/207）
+- 2026-08 单月 17 起，Term Finance $8.5M 治理攻击为本月代表
+
 ## [1.2.0] - 2026-08-28
 
 ### Added
